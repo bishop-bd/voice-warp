@@ -1,0 +1,73 @@
+name: Cross-platform checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: Linux
+          - os: windows-latest
+            platform: Windows
+          - os: macos-latest
+            platform: macOS
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build and audio dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libx11-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev \
+            libegl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            pulseaudio-utils pipewire pipewire-pulse wireplumber dbus-x11 \
+            desktop-file-utils shellcheck
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+      - name: Test the virtual microphone against isolated PipeWire
+        if: runner.os == 'Linux'
+        run: bash scripts/test-pipewire.sh
+      - name: Build Linux release
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked
+      - name: Build and package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\package-windows.ps1
+      - name: Build and package macOS app bundle
+        if: runner.os == 'macOS'
+        run: bash scripts/package-macos.sh
+      - name: Validate shell scripts and desktop packaging
+        if: runner.os == 'Linux'
+        run: |
+          bash -n scripts/install-bazzite.sh scripts/install-in-container.sh scripts/test-pipewire.sh scripts/package-macos.sh
+          shellcheck scripts/install-bazzite.sh scripts/install-in-container.sh scripts/test-pipewire.sh scripts/package-macos.sh
+          desktop-file-validate packaging/voice-warp.desktop
+      - name: Upload native desktop package
+        if: runner.os != 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-warp-${{ matrix.platform }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error

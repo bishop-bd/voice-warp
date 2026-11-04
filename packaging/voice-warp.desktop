@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Voice Warp
+Comment=Change your microphone voice and play sounds into any app
+Exec=/usr/local/bin/voice-warp
+Icon=voice-warp
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=microphone;voice;changer;soundboard;PipeWire;
+StartupNotify=true
+StartupWMClass=voice-warp
