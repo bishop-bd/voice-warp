@@ -13,6 +13,7 @@ use voice_warp::{
     audio::{AudioDevice, AudioEngine, AudioStats, Processor},
     config::Settings,
     dsp::{LiveControls, MixProcessor, PRESETS},
+    rvc::{self, RvcConfig, RvcProcessor},
     soundboard::Soundboard,
 };
 
@@ -39,6 +40,8 @@ enum Event {
     Started(Result<AudioEngine, String>),
     Stopped,
     Probed(Result<serde_json::Value, String>),
+    RvcInstalled(Result<(), String>),
+    RvcFile { index: bool, path: Option<PathBuf> },
     ImportProgress { current: usize, total: usize },
     Imported(Option<ImportReport>),
     Diagnostic(Result<serde_json::Value, String>),
@@ -280,6 +283,7 @@ impl VoiceWarpApp {
         } else {
             None
         };
+        let rvc_config = (self.use_ai && self.settings.ai_bundled).then(|| self.rvc_config());
         let mut engine = self.engine.take().unwrap_or_default();
         let tx = self.tx.clone();
         self.busy = Some("Connecting virtual microphone…".into());
@@ -290,7 +294,9 @@ impl VoiceWarpApp {
                     .as_ref()
                     .map(|config| config.block_size)
                     .unwrap_or(960);
-                let ai: Option<Box<dyn Processor>> = if let Some(config) = ai_config {
+                let ai: Option<Box<dyn Processor>> = if let Some(config) = rvc_config {
+                    Some(Box::new(RvcProcessor::new(config)?))
+                } else if let Some(config) = ai_config {
                     let processor = AIProcessor::new(config)?;
                     processor.probe()?;
                     Some(Box::new(processor))
@@ -330,12 +336,50 @@ impl VoiceWarpApp {
     }
     fn probe(&mut self) {
         let config = self.ai_config();
+        let rvc_config = self.settings.ai_bundled.then(|| self.rvc_config());
         let tx = self.tx.clone();
         self.busy = Some("Checking local AI engine…".into());
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Probed(
-                AIProcessor::new(config).and_then(|p| p.probe()),
-            ));
+            let _ = tx.send(Event::Probed(if let Some(config) = rvc_config {
+                RvcProcessor::new(config).map(|p| p.info.clone())
+            } else {
+                AIProcessor::new(config).and_then(|p| p.probe())
+            }));
+        });
+    }
+    fn rvc_config(&self) -> RvcConfig {
+        RvcConfig {
+            model: self.settings.rvc_model.clone(),
+            index: self.settings.rvc_index.clone(),
+            pitch: self.settings.rvc_pitch,
+            index_ratio: self.settings.rvc_index_ratio,
+            block_size: self.settings.ai_block_size,
+        }
+    }
+    fn choose_rvc_file(&mut self, index: bool) {
+        let tx = self.tx.clone();
+        let directory = self.settings.rvc_model.parent().map(PathBuf::from);
+        self.busy = Some("Choosing voice model…".into());
+        std::thread::spawn(move || {
+            let mut dialog = rfd::FileDialog::new();
+            if let Some(directory) = directory {
+                dialog = dialog.set_directory(directory);
+            }
+            let path = if index {
+                dialog.add_filter("RVC index", &["index"]).pick_file()
+            } else {
+                dialog
+                    .add_filter("RVC voice model", &["pth", "onnx"])
+                    .pick_file()
+            };
+            let _ = tx.send(Event::RvcFile { index, path });
+        });
+    }
+    fn install_rvc(&mut self) {
+        let tx = self.tx.clone();
+        self.busy = Some("Installing AI engine. The first setup downloads several GB and can take several minutes…".into());
+        std::thread::spawn(move || {
+            let _ = tx.send(Event::RvcInstalled(rvc::install()));
         });
     }
     fn push_controls(&self) {
@@ -368,6 +412,26 @@ impl VoiceWarpApp {
         while let Ok(event) = self.rx.try_recv() {
             self.busy = None;
             match event {
+                Event::RvcInstalled(result) => {
+                    self.message = Some(match result {
+                        Ok(()) => ("AI engine installed. Choose a voice model, then start your microphone.".into(), false),
+                        Err(error) => (error, true),
+                    });
+                }
+                Event::RvcFile { index, path } => {
+                    if let Some(path) = path {
+                        if index {
+                            self.settings.rvc_index = path;
+                        } else {
+                            self.settings.rvc_model = path;
+                            self.settings.rvc_index.clear();
+                        }
+                        self.ai_info = None;
+                        if let Err(error) = self.persist_settings() {
+                            self.message = Some((error, true));
+                        }
+                    }
+                }
                 Event::Devices(Ok((sources, outputs))) => {
                     self.sources = sources;
                     self.outputs = outputs;
@@ -770,10 +834,8 @@ impl VoiceWarpApp {
         });
         if self.use_ai {
             ui.label(
-                RichText::new(
-                    "AI mode is selected. Voice effects are controlled by your local AI server.",
-                )
-                .color(LILAC),
+                RichText::new("AI mode is selected. Choose your model and pitch in Local AI.")
+                    .color(LILAC),
             );
         }
         ui.add_space(16.0);
@@ -1029,36 +1091,69 @@ impl VoiceWarpApp {
     fn ai_page(&mut self, ui: &mut egui::Ui) {
         ui.add_space(18.0);
         card().show(ui, |ui| {
-            ui.horizontal(|ui| { pill(ui, "OPTIONAL / LOCAL RVC", LILAC); ui.label(RichText::new("Bring your own voice model").size(18.0).strong()); });
-            ui.add_space(8.0);
-            ui.label("Connect to a running w-okada v1 voice server on this computer. Select and load an RVC model in that server first; Voice Warp routes its converted audio to your virtual microphone.");
+            ui.horizontal(|ui| {
+                pill(ui, "LOCAL RVC", LILAC);
+                ui.label(RichText::new("Your AI voice").size(18.0).strong());
+            });
+            ui.label("Choose a voice model. Voice Warp starts the engine with your microphone and stops it when you disconnect.");
             ui.add_space(10.0);
-            ui.add_enabled_ui(!self.live() && self.busy.is_none(), |ui| {
-                ui.horizontal(|ui| { ui.label("Voice engine"); ui.selectable_value(&mut self.use_ai, false, "Built-in effects"); ui.selectable_value(&mut self.use_ai, true, "Local AI server"); });
-                ui.label(RichText::new("Server address (loopback only)").color(MUTED));
-                ui.add(egui::TextEdit::singleline(&mut self.settings.ai_endpoint).desired_width(450.0));
+            ui.add_enabled_ui(!self.preview && !self.live() && self.busy.is_none(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.use_ai, false, "Built-in effects");
+                    ui.selectable_value(&mut self.use_ai, true, "AI voice");
+                });
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.settings.ai_bundled, true, "Bundled engine");
+                    ui.selectable_value(&mut self.settings.ai_bundled, false, "External server");
+                });
+                if self.settings.ai_bundled {
+                    if rvc::supported() {
+                        if ui.button("Install / repair AI engine").clicked() { self.install_rvc(); }
+                        ui.label(RichText::new("One-time setup requires Podman and downloads the runtime and shared AI weights. Voice models are selected separately.").size(12.0).color(MUTED));
+                        ui.horizontal(|ui| {
+                            if ui.button("Choose voice model…").clicked() { self.choose_rvc_file(false); }
+                            ui.label(self.settings.rvc_model.file_name().unwrap_or_default().to_string_lossy());
+                        });
+                        ui.label(RichText::new("RVC .pth or .onnx. Choose files from a trusted model creator.").size(12.0).color(MUTED));
+                        ui.horizontal(|ui| {
+                            if ui.button("Choose matching index…").clicked() { self.choose_rvc_file(true); }
+                            if self.settings.rvc_index.as_os_str().is_empty() {
+                                ui.label("Optional");
+                            } else {
+                                ui.label(self.settings.rvc_index.file_name().unwrap_or_default().to_string_lossy());
+                                if ui.small_button("Clear").clicked() { self.settings.rvc_index.clear(); self.ai_info = None; }
+                            }
+                        });
+                        ui.add(egui::Slider::new(&mut self.settings.rvc_pitch, -24..=24).text("Pitch (semitones)"));
+                        ui.add_enabled(!self.settings.rvc_index.as_os_str().is_empty(),
+                            egui::Slider::new(&mut self.settings.rvc_index_ratio, 0.0..=1.0).text("Index strength"));
+                    } else {
+                        ui.label("Bundled AI is currently available on Linux x86-64. Use an external server on this platform.");
+                    }
+                } else {
+                    ui.label("Compatible w-okada v1 server address (loopback only)");
+                    ui.add(egui::TextEdit::singleline(&mut self.settings.ai_endpoint).desired_width(450.0));
+                }
                 ui.horizontal(|ui| {
                     ui.label("Audio chunk");
                     egui::ComboBox::from_id_salt("ai_chunk").selected_text(format!("{} samples / {:.0} ms", self.settings.ai_block_size, self.settings.ai_block_size as f32 / 48.0)).show_ui(ui, |ui| {
                         for size in [4096, 6144, 8192, 12288] { ui.selectable_value(&mut self.settings.ai_block_size, size, format!("{} samples / {:.0} ms", size, size as f32 / 48.0)); }
                     });
                 });
-                if ui.button("Check AI connection").clicked() { self.probe(); }
+                if ui.button("Test voice engine").clicked() { self.ai_info = None; self.probe(); }
             });
             if let Some(info) = &self.ai_info {
                 ui.add_space(8.0);
-                ui.label(RichText::new(format!("Ready: {}", info["model_name"].as_str().unwrap_or("RVC model"))).color(MINT));
+                ui.label(RichText::new(format!("Last successful test: {}", info["model_name"].as_str().unwrap_or("RVC model"))).color(MINT));
                 ui.label(RichText::new(format!("Device: {} · 48 kHz · local inference", info["device"])).size(12.0).color(MUTED));
             }
         });
         ui.add_space(16.0);
         card().show(ui, |ui| {
-            ui.label(RichText::new("Local AI performance").size(17.0).strong());
-            ui.label(RichText::new("Start with the AI server's CPU device (GPU = -1). GPU acceleration depends on the server, operating system, and installed runtime. AI has more latency than the built-in effects.").color(MUTED));
-            ui.add_space(8.0);
-            ui.label("Server settings: input and output 48000 Hz; Pass Through off; Server Audio off; Recording off. AI errors stop the microphone.");
-            ui.hyperlink_to("Server setup and model instructions", "https://github.com/w-okada/voice-changer/tree/d8ef15799470193f7c8176ef471245753a656626");
-            ui.label(RichText::new("Full instructions and the verified server revision are in docs/AI.md. Models and the AI server are separate installations.").size(12.0).color(MUTED));
+            ui.label(RichText::new("Performance").size(17.0).strong());
+            ui.label("The bundled engine uses your CPU. Try 8192 or 12288 samples if audio stutters. Larger chunks increase latency. Stop the microphone before changing the voice or pitch.");
+            ui.label("Your microphone stays on this computer. Conversion errors stop AI audio.");
+            ui.label(RichText::new(format!("Setup and engine logs: {}", rvc::runtime_dir().display())).size(12.0).color(MUTED));
         });
     }
 

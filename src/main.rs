@@ -35,6 +35,7 @@ fn main() {
                 | "--list-outputs"
                 | "--headless"
                 | "--render-demo"
+                | "--install-ai"
         )
     });
     #[cfg(target_os = "windows")]
@@ -62,6 +63,18 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--install-ai") {
+        if args.iter().any(|a| a == "--preview") {
+            return Err("AI installation is unavailable in preview mode.".into());
+        }
+        println!(
+            "Installing bundled RVC engine. Progress: {}",
+            voice_warp::rvc::runtime_dir().join("install.log").display()
+        );
+        voice_warp::rvc::install()?;
+        println!("AI engine installed. Choose your voice model in Local AI.");
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--preview") && args.iter().any(|a| a == "--headless") {
         return Err(
             "--preview cannot be combined with --headless; preview never opens audio streams."
@@ -70,7 +83,7 @@ fn run() -> Result<(), String> {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Voice Warp {}\n\nvoice-warp                       Open the desktop app\nvoice-warp --doctor [--report FILE] Check audio devices without recording\nvoice-warp --list-inputs         Print available microphone IDs\nvoice-warp --list-outputs        Print available playback IDs\nvoice-warp --headless --input ID [--output ID] [--seconds 10] [--preset 0..{}]\nvoice-warp --render-demo FILE    Write an offline DSP + soundboard WAV\nvoice-warp --preview             Inspect the UI without opening audio streams\n\nLinux creates a Voice Warp source automatically. Windows/macOS require a separately installed virtual cable; select its playback endpoint with --output.",
+            "Voice Warp {}\n\nvoice-warp                       Open the desktop app\nvoice-warp --doctor [--report FILE] Check audio devices without recording\nvoice-warp --list-inputs         Print available microphone IDs\nvoice-warp --list-outputs        Print available playback IDs\nvoice-warp --headless --input ID [--output ID] [--seconds 10] [--preset 0..{}]\nvoice-warp --render-demo FILE    Write an offline DSP + soundboard WAV\nvoice-warp --install-ai          Install the bundled Linux RVC runtime\nvoice-warp --preview             Inspect the UI without opening audio streams\n\nLinux creates a Voice Warp source automatically. Windows/macOS require a separately installed virtual cable; select its playback endpoint with --output.",
             env!("CARGO_PKG_VERSION"),
             PRESETS.len() - 1
         );

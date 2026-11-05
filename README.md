@@ -89,18 +89,20 @@ Settings and imported paths are saved in the user's configuration directory. Ori
 
 ## Optional local AI
 
-The shared Rust adapter connects to a separately installed **w-okada v1 RVC server** on the same computer. Load a model in that server, then select **Local AI** in Voice Warp. Models and the inference server are not included. See [AI setup, supported revision, and limitations](docs/AI.md).
+On Linux x86-64, Voice Warp manages its own **bundled RVC worker**. In **Local AI**, install the engine once, choose an RVC `.pth` or `.onnx` model and optional `.index`, and select **AI voice**. Voice Warp starts inference with the microphone and removes the worker when you stop. Model selection, pitch, and index strength are controlled in English inside Voice Warp. No w-okada server or browser interface is required.
 
-For the Radeon Vega 64 system, start with CPU inference. GPU acceleration depends on a separately compatible runtime and is not promised. Standard effects/soundboard require no AI runtime. The default AI chunk is 6144 samples, or 128 ms before inference and other buffering. Continuous real-time output requires a sufficiently fast model and processor.
+First-time setup uses Podman to download an isolated CPU runtime and checksum-verified shared inference weights. Standard effects and soundboard do not need this runtime. The engine recipe and worker are embedded in the desktop binary, including packaged releases; the large runtime is downloaded only when you choose **Install / repair AI engine**. Setup can also run with `voice-warp --install-ai`.
 
-The adapter accepts loopback addresses only, validates model/server settings, and never substitutes raw input for a failed conversion. The separately installed server can download assets; Voice Warp itself does not download models.
+The bundled runtime currently supports Linux x86-64 and standard HuBERT RVC v1/v2 models. Windows/macOS retain the optional external w-okada v1 adapter. See [AI setup and limitations](docs/AI.md).
+
+AI audio travels over private process pipes; the bundled worker has networking disabled and receives only the selected model/index files as read-only mounts. Failed conversion never substitutes your raw microphone. CPU performance depends on the model and hardware; larger chunks trade latency for throughput.
 
 ## Audio routing and failure behavior
 
 ```text
 Physical microphone
   -> native capture / format conversion
-  -> Rust effects OR local RVC server
+  -> Rust effects OR managed RVC worker
   -> Rust soundboard mixer + mute + limiter
   -> playback destination
        Linux: managed null sink -> Voice Warp source

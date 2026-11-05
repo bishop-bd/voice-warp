@@ -14,6 +14,11 @@ pub struct Settings {
     pub preset: usize,
     pub ai_endpoint: String,
     pub ai_block_size: usize,
+    pub ai_bundled: bool,
+    pub rvc_model: PathBuf,
+    pub rvc_index: PathBuf,
+    pub rvc_pitch: i32,
+    pub rvc_index_ratio: f32,
     pub sound_paths: Vec<PathBuf>,
     /// Original bundled-sound names hidden from the user's library.
     pub removed_builtin_sounds: Vec<String>,
@@ -31,6 +36,11 @@ impl Default for Settings {
             preset: 0,
             ai_endpoint: "http://127.0.0.1:18888".into(),
             ai_block_size: 6144,
+            ai_bundled: crate::rvc::supported(),
+            rvc_model: PathBuf::new(),
+            rvc_index: PathBuf::new(),
+            rvc_pitch: 0,
+            rvc_index_ratio: 0.5,
             sound_paths: Vec::new(),
             removed_builtin_sounds: Vec::new(),
             sound_volume: 0.75,
@@ -58,6 +68,12 @@ impl Settings {
         let mut settings: Self =
             serde_json::from_slice(bytes).map_err(|e| format!("Cannot parse settings: {e}"))?;
         settings.effects.sanitize();
+        settings.rvc_pitch = settings.rvc_pitch.clamp(-24, 24);
+        settings.rvc_index_ratio = if settings.rvc_index_ratio.is_finite() {
+            settings.rvc_index_ratio.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
         settings.preset = settings.preset.min(PRESETS.len() - 1);
         settings.ai_block_size = match settings.ai_block_size {
             4096 | 6144 | 8192 | 12288 => settings.ai_block_size,
@@ -124,6 +140,17 @@ mod tests {
     fn invalid_preset_is_clamped_to_the_current_library() {
         let restored = Settings::from_json(br#"{"preset":999}"#).unwrap();
         assert_eq!(restored.preset, PRESETS.len() - 1);
+    }
+
+    #[test]
+    fn rvc_settings_round_trip_and_invalid_values_are_clamped() {
+        let parsed = Settings::from_json(br#"{"rvc_model":"voice.onnx","rvc_index":"voice.index","rvc_pitch":99,"rvc_index_ratio":-3}"#).unwrap();
+        assert_eq!(parsed.ai_bundled, crate::rvc::supported());
+        assert_eq!(parsed.rvc_pitch, 24);
+        assert_eq!(parsed.rvc_index_ratio, 0.0);
+        let restored = Settings::from_json(&serde_json::to_vec(&parsed).unwrap()).unwrap();
+        assert_eq!(restored.rvc_model, PathBuf::from("voice.onnx"));
+        assert_eq!(restored.rvc_index, PathBuf::from("voice.index"));
     }
 
     #[test]

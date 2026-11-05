@@ -1,0 +1,14 @@
+FROM docker.io/library/ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-pip python3-dev build-essential libsndfile1 && rm -rf /var/lib/apt/lists/*
+RUN printf '\nprecedence ::ffff:0:0/96 100\n' >> /etc/gai.conf
+RUN git init /opt/rvc && cd /opt/rvc && git remote add origin https://github.com/w-okada/voice-changer.git && git fetch --depth 1 origin d8ef15799470193f7c8176ef471245753a656626 && git checkout FETCH_HEAD
+WORKDIR /opt/rvc/server
+RUN python3 -m pip install 'pip==24.0' 'wheel==0.45.1' 'setuptools==70.3.0'
+RUN python3 -m pip install torch==2.0.1 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu
+COPY requirements.txt /opt/voice-warp/requirements.txt
+RUN python3 -m pip install -r /opt/voice-warp/requirements.txt
+RUN mkdir /assets && curl -4fL --retry 3 https://huggingface.co/ddPn08/rvc-webui-models/resolve/main/embeddings/hubert_base.pt -o /assets/hubert_base.pt && echo 'f54b40fd2802423a5643779c4861af1e9ee9c1564dc9d32f54f20b5ffba7db96  /assets/hubert_base.pt' | sha256sum -c - && curl -4fL --retry 3 https://huggingface.co/wok000/weights_gpl/resolve/main/rmvpe/rmvpe_20231006.onnx -o /assets/rmvpe.onnx && echo '84f0586308e36157f75b77c8591bf636d6719c0c4ba95f8faf3df479e7566219  /assets/rmvpe.onnx' | sha256sum -c -
+COPY worker.py /opt/rvc/server/voice_warp_worker.py
+COPY NOTICE.md UPSTREAM-LICENSE /opt/voice-warp/
+ENTRYPOINT ["python3", "-u", "/opt/rvc/server/voice_warp_worker.py"]
