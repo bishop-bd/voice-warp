@@ -69,6 +69,7 @@ impl AudioEngine {
             .map_err(|e| format!("Cannot read pactl server information: {e}"))?;
         Ok(json!({
             "platform": "linux",
+            "version": env!("CARGO_PKG_VERSION"),
             "supported": true,
             "server": server,
             "inputs": Self::devices()?,
@@ -446,7 +447,16 @@ fn process_worker(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| processor.process(&samples)));
         let result = match result {
             Ok(result) => result,
-            Err(_) => Err("The voice processor stopped unexpectedly.".into()),
+            Err(payload) => {
+                let reason = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown processor panic");
+                Err(format!(
+                    "The voice processor stopped unexpectedly: {reason}"
+                ))
+            }
         };
         match result.and_then(|values| validate_output(values, samples.len())) {
             Ok(processed) => {
@@ -1130,6 +1140,48 @@ mod tests {
                 .unwrap()
                 .contains("AI server disconnected")
         );
+    }
+
+    #[test]
+    fn processor_panics_report_the_cause_without_forwarding_audio() {
+        struct Panic(bool);
+        impl Processor for Panic {
+            fn process(&mut self, _: &[f32]) -> Result<Vec<f32>, String> {
+                if self.0 {
+                    std::panic::panic_any(String::from("processor failure detail"));
+                }
+                panic!("processor failure detail");
+            }
+        }
+        for owned_message in [false, true] {
+            let input = Arc::new(BlockQueue::new(2));
+            let output = Arc::new(BlockQueue::new(2));
+            let state = WorkerState {
+                stop: Arc::new(AtomicBool::new(false)),
+                stats: Arc::new(Mutex::new(AudioStats::default())),
+                running: Arc::new(AtomicBool::new(true)),
+            };
+            input.push(vec![0.3, 0.2]);
+            process_worker(
+                Box::new(Panic(owned_message)),
+                input,
+                output.clone(),
+                state.clone(),
+            );
+            assert!(state.stop.load(Ordering::Acquire));
+            assert!(!state.running.load(Ordering::Acquire));
+            assert!(output.blocks.lock().unwrap().is_empty());
+            assert!(
+                state
+                    .stats
+                    .lock()
+                    .unwrap()
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("processor failure detail")
+            );
+        }
     }
 
     #[test]

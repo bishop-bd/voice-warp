@@ -31,8 +31,24 @@ if [[ "$build_from_source" != 0 && "$build_from_source" != 1 ]]; then
     echo 'VOICE_WARP_BUILD_FROM_SOURCE must be 0 or 1.' >&2
     exit 1
 fi
-if [[ ! -f "$project_root/Cargo.lock" ]]; then
-    echo 'Cargo.lock is missing. Run this installer from a complete Voice Warp checkout.' >&2
+bundled=0
+if [[ "$build_from_source" == 0 && -f "$project_root/bin/voice-warp" ]]; then
+    if [[ "$(uname -m)" != x86_64 ]]; then
+        echo 'This package is for x86-64 PCs and handhelds.' >&2
+        exit 1
+    fi
+    bundled=1
+elif [[ ! -f "$project_root/Cargo.lock" || ! -f "$project_root/Cargo.toml" ]]; then
+    echo 'No bundled binary or complete source checkout found. Download the complete installer again.' >&2
+    exit 1
+fi
+
+# Distrobox already shares the real home directory. Do not bind a temporary
+# extraction directory into the container: the download may be deleted later.
+user_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+user_home="$(cd -- "$user_home" && pwd -P)"
+if [[ "$project_root" != "$user_home/"* ]]; then
+    echo 'Move this folder inside your home directory before installing.' >&2
     exit 1
 fi
 
@@ -46,13 +62,16 @@ if awk -F '|' -v wanted="$container_name" '
     printf 'Using existing Distrobox: %s\n' "$container_name"
 else
     printf 'Creating Fedora 43 Distrobox: %s\n' "$container_name"
-    distrobox create --yes --name "$container_name" \
-        --image registry.fedoraproject.org/fedora:43 \
-        --volume "$project_root:$project_root"
+    create_args=(--yes --no-entry --name "$container_name"
+        --image registry.fedoraproject.org/fedora:43)
+    if [[ -d /sys/module/nvidia ]]; then
+        create_args+=(--nvidia)
+    fi
+    distrobox create "${create_args[@]}"
 fi
 
 printf '\nInstalling inside %s. The Bazzite host image stays unchanged.\n' "$container_name"
-if [[ "$build_from_source" != 1 && "$(uname -m)" == x86_64 && -f "$project_root/bin/voice-warp" ]]; then
+if [[ "$bundled" == 1 ]]; then
     printf 'Using the bundled Linux binary after checksum verification.\n'
 else
     printf 'No matching bundled binary selected; compiling from source.\n'
@@ -62,5 +81,7 @@ distrobox enter --name "$container_name" -- \
     bash "$project_root/scripts/install-in-container.sh"
 
 printf '\nInstalled. Open “Voice Warp” from your application launcher.\n'
+printf 'If it was already open, close and reopen it to use the updated version.\n'
 printf 'Terminal launch: distrobox enter --name %s -- /usr/local/bin/voice-warp\n' "$container_name"
 printf 'Select “Voice Warp” as the microphone in Discord, games, or OBS after starting the app.\n'
+printf 'You can now delete the downloaded installer.\n'

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Self-extracting Voice Warp installer. The archive after the final marker is data.
+set -euo pipefail
+
+version='@VOICE_WARP_VERSION@'
+payload_sha256='@VOICE_WARP_PAYLOAD_SHA256@'
+
+usage() {
+    cat <<EOF
+Voice Warp $version for Bazzite (x86_64)
+
+Install:    bash "$0"
+Uninstall:  bash "$0" --uninstall
+Verify:     bash "$0" --check
+Extract:    bash "$0" --extract DIRECTORY
+
+Installation needs an internet connection and Distrobox. It sets up the app
+and its launcher automatically. Run as your normal desktop user, without sudo.
+EOF
+}
+
+mode=install
+extract_dir=''
+case "${1:-}" in
+    '') ;;
+    --install) ;;
+    --uninstall) mode=uninstall ;;
+    --check) mode=check ;;
+    --extract)
+        if [[ $# -ne 2 || -z "$2" ]]; then
+            usage >&2
+            exit 2
+        fi
+        mode=extract
+        extract_dir=$2
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+if [[ "$mode" != extract && $# -gt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+for program in awk tail sha256sum mktemp tar; do
+    if ! command -v "$program" >/dev/null 2>&1; then
+        printf 'Required command is missing: %s\n' "$program" >&2
+        exit 1
+    fi
+done
+
+if [[ "$mode" == install || "$mode" == uninstall ]]; then
+    if [[ $EUID -eq 0 ]]; then
+        echo 'Run this installer as your normal desktop user, without sudo.' >&2
+        exit 1
+    fi
+    if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
+        echo 'This package is for x86_64 Linux computers running Bazzite.' >&2
+        exit 1
+    fi
+    if ! command -v distrobox >/dev/null 2>&1; then
+        echo 'Distrobox is required. Use the Distrobox installation provided by Bazzite.' >&2
+        exit 1
+    fi
+    # Use Distrobox's shared home without depending on its temporary-directory
+    # configuration. A real home path also avoids symlinked cache directories.
+    user_home="$(getent passwd "$(id -u)" | cut -d: -f6)"
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+        echo 'Could not locate your home directory.' >&2
+        exit 1
+    fi
+    user_home="$(cd -- "$user_home" && pwd -P)"
+    workdir="$(mktemp -d "$user_home/.voice-warp-installer.XXXXXX")"
+else
+    workdir="$(mktemp -d -t voice-warp-installer.XXXXXX)"
+fi
+# Only the exact directory returned by mktemp is removed.
+trap 'rm -rf -- "$workdir"' EXIT
+
+payload_line="$(awk '/^__VOICE_WARP_ARCHIVE__$/ { print NR + 1; exit }' "$0")"
+if [[ ! "$payload_line" =~ ^[0-9]+$ ]]; then
+    echo 'The installer archive is missing. Download the complete file again.' >&2
+    exit 1
+fi
+tail -n "+$payload_line" -- "$0" > "$workdir/payload.tar.gz"
+actual_sha256="$(sha256sum < "$workdir/payload.tar.gz")"
+actual_sha256=${actual_sha256%% *}
+if [[ "$actual_sha256" != "$payload_sha256" ]]; then
+    echo 'Installer checksum verification failed. Download the complete file again.' >&2
+    exit 1
+fi
+if [[ "$mode" == check ]]; then
+    printf 'Voice Warp %s: installer checksum verified.\n' "$version"
+    exit 0
+fi
+
+if [[ "$mode" == extract ]]; then
+    if [[ -e "$extract_dir" || -L "$extract_dir" ]]; then
+        echo 'The extraction directory already exists. Choose a new directory.' >&2
+        exit 1
+    fi
+    mkdir -p -- "$extract_dir"
+    tar --extract --gzip --file "$workdir/payload.tar.gz" \
+        --directory "$extract_dir" --no-same-owner --no-same-permissions
+    printf 'Extracted Voice Warp %s to %s\n' "$version" "$extract_dir"
+    exit 0
+fi
+
+mkdir -- "$workdir/package"
+tar --extract --gzip --file "$workdir/payload.tar.gz" \
+    --directory "$workdir/package" --no-same-owner --no-same-permissions
+if [[ "$mode" == uninstall ]]; then
+    bash "$workdir/package/scripts/uninstall-bazzite.sh"
+else
+    printf 'Installing Voice Warp %s…\n' "$version"
+    bash "$workdir/package/scripts/install-bazzite.sh"
+fi
+exit 0
+# shellcheck disable=SC2317
+__VOICE_WARP_ARCHIVE__

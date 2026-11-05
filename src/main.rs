@@ -70,8 +70,9 @@ fn run() -> Result<(), String> {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Voice Warp {}\n\nvoice-warp                       Open the desktop app\nvoice-warp --doctor [--report FILE] Check audio devices without recording\nvoice-warp --list-inputs         Print available microphone IDs\nvoice-warp --list-outputs        Print available playback IDs\nvoice-warp --headless --input ID [--output ID] [--seconds 10] [--preset 0..5]\nvoice-warp --render-demo FILE    Write an offline DSP + soundboard WAV\nvoice-warp --preview             Inspect the UI without opening audio streams\n\nLinux creates a Voice Warp source automatically. Windows/macOS require a separately installed virtual cable; select its playback endpoint with --output.",
-            env!("CARGO_PKG_VERSION")
+            "Voice Warp {}\n\nvoice-warp                       Open the desktop app\nvoice-warp --doctor [--report FILE] Check audio devices without recording\nvoice-warp --list-inputs         Print available microphone IDs\nvoice-warp --list-outputs        Print available playback IDs\nvoice-warp --headless --input ID [--output ID] [--seconds 10] [--preset 0..{}]\nvoice-warp --render-demo FILE    Write an offline DSP + soundboard WAV\nvoice-warp --preview             Inspect the UI without opening audio streams\n\nLinux creates a Voice Warp source automatically. Windows/macOS require a separately installed virtual cable; select its playback endpoint with --output.",
+            env!("CARGO_PKG_VERSION"),
+            PRESETS.len() - 1
         );
         return Ok(());
     }
@@ -141,7 +142,7 @@ fn run() -> Result<(), String> {
         let mut controls = LiveControls::default();
         PRESETS
             .get(preset)
-            .ok_or("Preset must be 0..5")?
+            .ok_or_else(|| format!("Preset must be 0..{}", PRESETS.len() - 1))?
             .apply(&mut controls.effects);
         let processor = MixProcessor::new(
             Arc::new(Mutex::new(controls)),
@@ -210,10 +211,12 @@ fn render_demo(path: &str) -> Result<(), String> {
     let mut settings = Settings::default().effects;
     let mut board = Soundboard::with_defaults();
     let ids: Vec<_> = board.list().iter().map(|clip| clip.id).collect();
-    for block in 0..400 {
-        PRESETS[(block / 80).min(5)].apply(&mut settings);
-        if block % 100 == 0 {
-            board.trigger(ids[block / 100])?;
+    for block in 0..PRESETS.len() * 80 {
+        PRESETS[block / 80].apply(&mut settings);
+        if block % 100 == 0
+            && let Some(&id) = ids.get(block / 100)
+        {
+            board.trigger(id)?;
         }
         let input: Vec<f32> = (0..960)
             .map(|n| {

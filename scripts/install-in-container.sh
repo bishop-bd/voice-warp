@@ -52,7 +52,8 @@ if [[ "$build_from_source" != 1 && "$(uname -m)" == x86_64 && -f "$project_root/
     printf 'Installing runtime dependencies inside Distrobox…\n'
     sudo dnf install -y \
         libX11 libXcursor libXi libXrandr libxcb libxkbcommon libxkbcommon-x11 \
-        wayland-libs mesa-libGL mesa-libEGL mesa-dri-drivers libstdc++ \
+        libwayland-client libwayland-cursor libwayland-egl \
+        mesa-libGL mesa-libEGL mesa-dri-drivers libstdc++ \
         fontconfig freetype pulseaudio-utils desktop-file-utils
     binary_path="$project_root/bin/voice-warp"
 else
@@ -70,12 +71,20 @@ else
     binary_path="$project_root/target/release/voice-warp"
 fi
 
-# Setting the mode here also handles archives extracted on NTFS or FAT.
-sudo install -Dm755 "$binary_path" /usr/local/bin/voice-warp
+# Verify that the bundled build runs against this container's libraries before
+# replacing any existing installation.
+chmod u+x "$binary_path"
+"$binary_path" --help >/dev/null
+
+# Atomic replacement also permits updating while the old executable is open.
+sudo install -Dm755 "$binary_path" /usr/local/bin/voice-warp.new
+sudo mv -f /usr/local/bin/voice-warp.new /usr/local/bin/voice-warp
 sudo install -Dm644 "$project_root/packaging/voice-warp.desktop" \
-    /usr/local/share/applications/voice-warp.desktop
+    /usr/local/share/applications/voice-warp-bazzite.desktop
+sudo sed -i 's/^Icon=voice-warp$/Icon=voice-warp-bazzite/' \
+    /usr/local/share/applications/voice-warp-bazzite.desktop
 sudo install -Dm644 "$project_root/packaging/voice-warp.svg" \
-    /usr/local/share/icons/hicolor/scalable/apps/voice-warp.svg
-desktop-file-validate /usr/local/share/applications/voice-warp.desktop
+    /usr/share/icons/hicolor/scalable/apps/voice-warp-bazzite.svg
+desktop-file-validate /usr/local/share/applications/voice-warp-bazzite.desktop
 sudo update-desktop-database /usr/local/share/applications
-distrobox-export --app /usr/local/share/applications/voice-warp.desktop --export-label none
+distrobox-export --app /usr/local/share/applications/voice-warp-bazzite.desktop --export-label none

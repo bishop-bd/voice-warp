@@ -34,6 +34,16 @@ The script builds the MSVC x64 target with a statically linked C runtime and cre
 
 ## Bazzite quick start
 
+For the prebuilt package, copy `Voice-Warp-0.3.0-Bazzite-x86_64.run` to your Bazzite machine and run this in Desktop Mode:
+
+```bash
+bash Voice-Warp-0.3.0-Bazzite-x86_64.run
+```
+
+Open **Voice Warp** from the applications menu when installation finishes. No compilation or reboot is needed. The first installation needs internet access. See [Bazzite installation, updates, and removal](docs/BAZZITE.md).
+
+### Install from a source checkout
+
 Copy or extract the project under your home directory. From a **host terminal**, run without `sudo`:
 
 ```bash
@@ -64,10 +74,12 @@ Open the app, allow microphone access, select the physical mic and BlackHole pla
 
 ## Voice effects and soundboard
 
-- Six presets: **Natural, Titan, Helium, Synth, Ghost, and Radio**.
-- Adjustable pitch, robot texture, echo, voice gain, noise gate, radio filtering, and bypass. These run locally on the CPU.
-- Four original synthesized sounds: **Chime, Airhorn, Level up, and Rimshot**.
-- Up to 12 imported WAVs besides the built-ins: 16 total slots and 8 simultaneous sounds.
+- Eleven presets: **Natural, Titan, Helium, Synth, Ghost, Radio, Demon, Space Marine, Alien, Cartoon, and Announcer**.
+- The new voices add a gritty deep growl (Demon), armored communications (Space Marine), a wavering layered voice (Alien), bright playful character (Cartoon), and warm room presence (Announcer).
+- Adjustable pitch, warm/bright tone, robot texture, distortion, chorus, echo, reverb, voice gain, noise gate, radio filtering, and bypass. These run locally on the CPU. Fine-tune any preset; tone at zero is neutral, and distortion, chorus, and reverb at zero are off.
+- Four original synthesized sounds: **Chime, Airhorn, Level up, and Rimshot**. Any sound, including a built-in, can be removed from the library; removals are saved across restarts.
+- No fixed limit on the number of sounds in the library. Up to 8 sounds play simultaneously.
+- Select multiple WAVs in **Import WAVs** to import them together. Invalid files are reported without stopping the remaining imports; selecting an existing file reuses its sound.
 - PCM 8/16/24/32-bit and float32 WAV import, multichannel downmix, and 48 kHz resampling. Imports are limited to 60 seconds and 128 MiB each. Stop the microphone before importing.
 - Keys **1–9** play sounds; **Esc** stops them while the app window is focused. These are not global game hotkeys.
 - **Mute voice** leaves the soundboard audible. **Mute all** silences both. Clips mix after conversion, so voice effects and AI do not alter them.
@@ -150,7 +162,7 @@ voice-warp --preview
 
 **Linux device left after a forced crash:** close all instances and inspect `pactl list short modules`. Unload only Voice Warp's `module-remap-source` (`source_name=voice_warp`), null sink (`sink_name=voice_warp_sink`), and any loopback whose source is Voice Warp, using `pactl unload-module MODULE_ID`.
 
-**Remove Bazzite launcher:** inside the container, run `distrobox-export --app /usr/local/share/applications/voice-warp.desktop --delete`. Removing that container separately removes its app/tools. Settings and original WAVs stay in your home. Windows is portable; uninstall audio drivers separately with vendor instructions.
+**Remove the Bazzite app:** close it, then run the `.run` installer with `--uninstall`, or run `bash scripts/uninstall-bazzite.sh` from a source checkout. Settings and original WAVs stay in your home. Windows is portable; uninstall audio drivers separately with vendor instructions.
 
 ## Code layout
 

@@ -290,11 +290,11 @@ fn validate_info(info: &Value) -> Result<ModelInfo, String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or("The selected RVC model has no model file.")?;
-    if !info
+    if info
         .get("pipelineInfo")
         .and_then(|v| v.get("inferencer"))
         .and_then(Value::as_object)
-        .is_some_and(|v| !v.is_empty())
+        .is_none_or(|v| v.is_empty())
     {
         return Err("The RVC inference pipeline is not initialized. Select CPU or a supported GPU in the AI server, then inspect its console.".into());
     }

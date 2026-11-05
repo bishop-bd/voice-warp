@@ -39,8 +39,53 @@ enum Event {
     Started(Result<AudioEngine, String>),
     Stopped,
     Probed(Result<serde_json::Value, String>),
-    Imported(Result<PathBuf, String>),
+    ImportProgress { current: usize, total: usize },
+    Imported(Option<ImportReport>),
     Diagnostic(Result<serde_json::Value, String>),
+}
+
+#[derive(Default)]
+struct ImportReport {
+    loaded: usize,
+    errors: Vec<String>,
+}
+
+impl ImportReport {
+    fn message(&self) -> String {
+        let mut message = format!(
+            "{} WAV {} loaded.",
+            self.loaded,
+            if self.loaded == 1 { "file" } else { "files" }
+        );
+        if !self.errors.is_empty() {
+            message.push('\n');
+            message.push_str(&self.errors.join("\n"));
+        }
+        message
+    }
+}
+
+fn import_sounds(
+    board: &Mutex<Soundboard>,
+    paths: &[PathBuf],
+    mut progress: impl FnMut(usize, usize),
+) -> ImportReport {
+    let mut report = ImportReport::default();
+    for (index, path) in paths.iter().enumerate() {
+        progress(index + 1, paths.len());
+        // Decode outside the lock so the UI remains responsive during large imports.
+        let result = Soundboard::prepare(path).and_then(|clip| {
+            board
+                .lock()
+                .map_err(|_| "Soundboard unavailable".to_string())?
+                .insert(clip)
+        });
+        match result {
+            Ok(_) => report.loaded += 1,
+            Err(error) => report.errors.push(format!("{}: {error}", path.display())),
+        }
+    }
+    report
 }
 
 pub struct VoiceWarpApp {
@@ -109,7 +154,7 @@ impl VoiceWarpApp {
                 Err(e) => (Settings::default(), Some((e, true))),
             }
         };
-        let mut board = Soundboard::with_defaults();
+        let mut board = Soundboard::with_removed_builtins(&settings.removed_builtin_sounds);
         board.set_volume(settings.sound_volume);
         for path in &settings.sound_paths {
             if let Err(e) = board.load(path) {
@@ -298,9 +343,9 @@ impl VoiceWarpApp {
             controls.effects = self.settings.effects.clone();
         }
     }
-    fn save(&mut self) {
+    fn persist_settings(&mut self) -> Result<(), String> {
         if self.preview {
-            return;
+            return Ok(());
         }
         let board = self.board.lock().unwrap();
         self.settings.sound_volume = board.volume();
@@ -309,8 +354,12 @@ impl VoiceWarpApp {
             .into_iter()
             .filter_map(|clip| clip.path)
             .collect();
+        self.settings.removed_builtin_sounds = board.removed_builtin_sounds();
         drop(board);
-        self.message = Some(match self.settings.save() {
+        self.settings.save()
+    }
+    fn save(&mut self) {
+        self.message = Some(match self.persist_settings() {
             Ok(()) => ("Settings saved.".into(), false),
             Err(e) => (format!("Could not save settings: {e}"), true),
         });
@@ -389,9 +438,21 @@ impl VoiceWarpApp {
                         false,
                     ));
                 }
-                Event::Imported(Ok(_path)) => {
-                    self.save();
-                    self.message = Some(("Sound added to your board.".into(), false));
+                Event::ImportProgress { current, total } => {
+                    self.busy = Some(format!("Importing WAV {current} of {total}…"));
+                }
+                Event::Imported(Some(mut report)) => {
+                    if report.loaded > 0
+                        && let Err(error) = self.persist_settings()
+                    {
+                        report
+                            .errors
+                            .push(format!("Could not save library: {error}"));
+                    }
+                    self.message = Some((report.message(), !report.errors.is_empty()));
+                }
+                Event::Imported(None) => {
+                    self.message = Some(("Import cancelled.".into(), false));
                 }
                 Event::Diagnostic(Ok(info)) => {
                     self.diagnostics = serde_json::to_string_pretty(&info).ok();
@@ -399,7 +460,6 @@ impl VoiceWarpApp {
                 Event::Devices(Err(e))
                 | Event::Started(Err(e))
                 | Event::Probed(Err(e))
-                | Event::Imported(Err(e))
                 | Event::Diagnostic(Err(e)) => {
                     self.message = Some((e, true));
                 }
@@ -663,7 +723,7 @@ impl VoiceWarpApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Choose your character").size(19.0).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                pill(ui, "6 LIVE EFFECTS", MUTED);
+                pill(ui, &format!("{} VOICE PRESETS", PRESETS.len()), MUTED);
             });
         });
         ui.add_space(6.0);
@@ -739,6 +799,14 @@ impl VoiceWarpApp {
                     );
                     slider(
                         &mut columns[0],
+                        "Tone",
+                        &mut self.settings.effects.tone,
+                        -1.0..=1.0,
+                        "",
+                    )
+                    .on_hover_text("Negative values add warmth; positive values brighten your voice. Zero is neutral.");
+                    slider(
+                        &mut columns[0],
                         "Robot texture",
                         &mut self.settings.effects.robot,
                         0.0..=1.0,
@@ -746,11 +814,35 @@ impl VoiceWarpApp {
                     );
                     slider(
                         &mut columns[0],
+                        "Distortion",
+                        &mut self.settings.effects.distortion,
+                        0.0..=1.0,
+                        "",
+                    )
+                    .on_hover_text("Adds soft saturation and grit. Zero turns distortion off.");
+                    slider(
+                        &mut columns[0],
+                        "Chorus",
+                        &mut self.settings.effects.chorus,
+                        0.0..=1.0,
+                        "",
+                    )
+                    .on_hover_text("Blends gently shifting copies of your voice for a layered, wavering sound.");
+                    slider(
+                        &mut columns[1],
                         "Echo",
                         &mut self.settings.effects.echo,
                         0.0..=0.65,
                         "",
                     );
+                    slider(
+                        &mut columns[1],
+                        "Reverb",
+                        &mut self.settings.effects.reverb,
+                        0.0..=0.65,
+                        "",
+                    )
+                    .on_hover_text("Adds room reflections and a fading tail. Zero turns reverb off.");
                     slider(
                         &mut columns[1],
                         "Voice gain",
@@ -779,7 +871,7 @@ impl VoiceWarpApp {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Soundboard").size(19.0).strong());
             ui.label(
-                RichText::new(format!("{} / 16 sounds", clips.len()))
+                RichText::new(format!("{} sounds", clips.len()))
                     .size(12.0)
                     .color(MUTED),
             );
@@ -791,9 +883,11 @@ impl VoiceWarpApp {
                 } else if ui
                     .add_enabled(
                         !live && self.busy.is_none(),
-                        egui::Button::new("+ Import WAV"),
+                        egui::Button::new("+ Import WAVs"),
                     )
-                    .on_hover_text("Stop the microphone before importing a file")
+                    .on_hover_text(
+                        "Select one or more WAV files. Stop the microphone before importing.",
+                    )
                     .clicked()
                 {
                     self.import();
@@ -834,7 +928,11 @@ impl VoiceWarpApp {
         .num_columns(4)
         .spacing([10.0, 10.0])
         .show(ui, |ui| {
-            for (index, clip) in clips.iter().take(if compact { 4 } else { 16 }).enumerate() {
+            for (index, clip) in clips
+                .iter()
+                .take(if compact { 4 } else { clips.len() })
+                .enumerate()
+            {
                 ui.vertical(|ui| {
                     let shortcut = if index < 9 {
                         format!("{}", index + 1)
@@ -877,7 +975,7 @@ impl VoiceWarpApp {
                     {
                         let _ = self.board.lock().unwrap().trigger(clip.id);
                     }
-                    if !compact && clip.path.is_some() && ui.small_button("Remove").clicked() {
+                    if !compact && ui.small_button("Remove").clicked() {
                         remove = Some(clip.id);
                     }
                 });
@@ -888,12 +986,25 @@ impl VoiceWarpApp {
         });
         if let Some(id) = remove {
             self.board.lock().unwrap().remove(id);
+            self.message = Some(match self.persist_settings() {
+                Ok(()) => ("Sound removed from your library.".into(), false),
+                Err(error) => (
+                    format!("Sound removed, but could not save library: {error}"),
+                    true,
+                ),
+            });
+        }
+        if clips.is_empty() {
+            ui.label(
+                RichText::new("Your soundboard is empty. Import WAV files to add sounds.")
+                    .color(MUTED),
+            );
         }
         if !compact {
             ui.add_space(18.0);
             card().show(ui, |ui| {
                 eyebrow(ui, "YOUR CLIPS, YOUR LIBRARY");
-                ui.label(RichText::new("Import PCM or float WAV files up to 60 seconds. Stereo files are mixed to mono and resampled automatically. Your imported files stay on this machine.").color(MUTED));
+                ui.label(RichText::new("Select multiple WAV files to import them together. There is no limit on the number of sounds in your library. Each PCM or float WAV can be up to 60 seconds. Stereo files are mixed to mono and resampled automatically. Removing a sound leaves its original file in place.").color(MUTED));
             });
         }
     }
@@ -901,24 +1012,16 @@ impl VoiceWarpApp {
     fn import(&mut self) {
         let board = self.board.clone();
         let tx = self.tx.clone();
-        self.busy = Some("Choose a WAV sound…".into());
+        self.busy = Some("Choose WAV sounds…".into());
         std::thread::spawn(move || {
-            let result = match rfd::FileDialog::new()
+            let result = rfd::FileDialog::new()
                 .add_filter("WAV audio", &["wav"])
-                .pick_file()
-            {
-                Some(path) => Soundboard::prepare(&path).and_then(|clip| {
-                    board
-                        .lock()
-                        .map_err(|_| "Soundboard unavailable".to_string())?
-                        .insert(clip)
-                        .map(|_| path)
-                }),
-                None => {
-                    let _ = tx.send(Event::Imported(Err("Import cancelled.".into())));
-                    return;
-                }
-            };
+                .pick_files()
+                .map(|paths| {
+                    import_sounds(&board, &paths, |current, total| {
+                        let _ = tx.send(Event::ImportProgress { current, total });
+                    })
+                });
             let _ = tx.send(Event::Imported(result));
         });
     }
@@ -1241,18 +1344,26 @@ fn slider(
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     suffix: &str,
-) {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [98.0, 20.0],
-            egui::Label::new(RichText::new(label).size(12.0).color(MUTED)),
-        );
-        ui.add(
-            egui::Slider::new(value, range)
-                .suffix(suffix)
-                .max_decimals(1),
-        );
-    });
+) -> egui::Response {
+    // Keep the label and numeric editor inside each column at narrow widths.
+    let track_width =
+        (ui.available_width() - 98.0 - 90.0 - 2.0 * ui.spacing().item_spacing.x).clamp(60.0, 190.0);
+    ui.scope(|ui| {
+        ui.spacing_mut().slider_width = track_width;
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [98.0, 20.0],
+                egui::Label::new(RichText::new(label).size(12.0).color(MUTED)),
+            );
+            ui.add(
+                egui::Slider::new(value, range)
+                    .suffix(suffix)
+                    .max_decimals(1),
+            );
+        })
+        .response
+    })
+    .inner
 }
 fn meter(ui: &mut egui::Ui, label: &str, peak: f32, color: Color32) {
     ui.horizontal(|ui| {
@@ -1290,5 +1401,65 @@ fn logo(ui: &mut egui::Ui, size: f32) {
             ],
             Stroke::new(2.5_f32, BG),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_import_continues_after_errors_and_reuses_duplicate_paths() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("voice-warp-batch-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..24 {
+            let path = directory.join(format!("sound-{index}.wav"));
+            let mut writer = hound::WavWriter::create(
+                &path,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 48_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .unwrap();
+            writer.write_sample(8192_i16).unwrap();
+            writer.finalize().unwrap();
+            paths.push(path);
+        }
+        let invalid = directory.join("broken.wav");
+        std::fs::write(&invalid, b"not WAV audio").unwrap();
+        paths.insert(1, invalid);
+        paths.push(paths[0].clone());
+        let board = Mutex::new(Soundboard::new());
+        let mut progress = Vec::new();
+        let report = import_sounds(&board, &paths, |current, total| {
+            progress.push((current, total));
+        });
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(report.loaded, 25);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("broken.wav"));
+        assert_eq!(
+            progress,
+            (1..=26).map(|current| (current, 26)).collect::<Vec<_>>()
+        );
+        let mut board = board.lock().unwrap();
+        let clips = board.list();
+        assert_eq!(clips.len(), 24);
+        assert_eq!(clips.first().unwrap().name, "sound-0");
+        assert_eq!(clips.last().unwrap().name, "sound-23");
+        board.trigger(clips.last().unwrap().id).unwrap();
+        let mut output = [0.0];
+        board.mix_into(&mut output);
+        assert!(output[0] > 0.0);
     }
 }

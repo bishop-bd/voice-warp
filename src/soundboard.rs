@@ -9,10 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const SAMPLE_RATE: u32 = 48_000;
-pub const MAX_CLIPS: usize = 16;
 pub const MAX_VOICES: usize = 8;
 const MAX_SECONDS: u32 = 60;
 const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
+// These names also identify removed bundled sounds in saved settings.
+const BUILTIN_NAMES: [&str; 4] = ["Chime", "Air horn", "Level up", "Rimshot"];
 
 pub type ClipId = u64;
 
@@ -72,16 +73,37 @@ impl Soundboard {
     }
 
     pub fn with_defaults() -> Self {
+        Self::with_removed_builtins(&[])
+    }
+
+    /// Restore the bundled sounds the user has kept in their library.
+    pub fn with_removed_builtins(removed: &[String]) -> Self {
         let mut board = Self::new();
-        for (name, samples) in [
-            ("Chime", synth_chime()),
-            ("Air horn", synth_airhorn()),
-            ("Level up", synth_arcade()),
-            ("Rimshot", synth_rimshot()),
-        ] {
-            board.insert_samples(name.into(), None, samples);
+        for (name, samples) in BUILTIN_NAMES.into_iter().zip([
+            synth_chime(),
+            synth_airhorn(),
+            synth_arcade(),
+            synth_rimshot(),
+        ]) {
+            if !removed.iter().any(|removed| removed == name) {
+                board.insert_samples(name.into(), None, samples);
+            }
         }
         board
+    }
+
+    /// Persist bundled-sound removals independently of imported file names.
+    pub fn removed_builtin_sounds(&self) -> Vec<String> {
+        BUILTIN_NAMES
+            .into_iter()
+            .filter(|name| {
+                !self
+                    .clips
+                    .iter()
+                    .any(|clip| clip.path.is_none() && clip.name == *name)
+            })
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Import a PCM or IEEE float WAV, downmix it, and resample to 48 kHz.
@@ -120,7 +142,6 @@ impl Soundboard {
     }
 
     /// Insert a prepared clip without disk I/O, decoding, or audio allocation.
-    /// Check capacity here because other imports may have arrived meanwhile.
     pub fn insert(&mut self, clip: PreparedClip) -> Result<ClipId, String> {
         if let Some(existing) = self
             .clips
@@ -128,11 +149,6 @@ impl Soundboard {
             .find(|existing| existing.path.as_ref() == Some(&clip.path))
         {
             return Ok(existing.id);
-        }
-        if self.clips.len() >= MAX_CLIPS {
-            return Err(format!(
-                "The soundboard holds {MAX_CLIPS} sounds. Remove one before importing another."
-            ));
         }
         Ok(self.insert_samples(clip.name, Some(clip.path), clip.samples))
     }
@@ -567,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_import_reuses_paths_and_checks_current_capacity() {
+    fn prepared_import_has_no_library_count_limit_and_reuses_paths() {
         let prepared = |number: usize| PreparedClip {
             name: format!("Sound {number}"),
             path: PathBuf::from(format!("sound-{number}.wav")),
@@ -575,18 +591,48 @@ mod tests {
         };
         let mut board = Soundboard::new();
         let first = board.insert(prepared(0)).unwrap();
-        let waiting_import = prepared(MAX_CLIPS);
-        for number in 1..MAX_CLIPS {
+        for number in 1..100 {
             board.insert(prepared(number)).unwrap();
         }
-        assert!(board.insert(waiting_import.clone()).is_err());
-        assert_eq!(board.list().len(), MAX_CLIPS);
-        // Reimporting an existing path does not consume another slot.
+        assert_eq!(board.list().len(), 100);
+        // Reimporting an existing path does not duplicate the sound.
         assert_eq!(board.insert(prepared(0)).unwrap(), first);
-        assert_eq!(board.list().len(), MAX_CLIPS);
+        assert_eq!(board.list().len(), 100);
         board.remove(first);
-        assert!(board.insert(waiting_import).is_ok());
-        assert_eq!(board.list().len(), MAX_CLIPS);
+        assert!(board.insert(prepared(100)).is_ok());
+        assert_eq!(board.list().len(), 100);
+    }
+
+    #[test]
+    fn removed_builtins_stay_removed_after_restoring_the_library() {
+        let mut board = Soundboard::with_defaults();
+        assert!(board.removed_builtin_sounds().is_empty());
+        let chime = board.list()[0].id;
+        board.trigger(chime).unwrap();
+        assert!(board.remove(chime));
+        assert_eq!(board.active_count(), 0);
+        assert!(board.trigger(chime).is_err());
+        // An imported sound with the same display name is a separate item.
+        board
+            .insert(PreparedClip {
+                name: "Chime".into(),
+                path: PathBuf::from("Chime.wav"),
+                samples: vec![0.1; 4].into(),
+            })
+            .unwrap();
+        let removed = board.removed_builtin_sounds();
+        assert_eq!(removed, ["Chime"]);
+        let mut restored = Soundboard::with_removed_builtins(&removed);
+        assert_eq!(restored.list().len(), 3);
+        assert_eq!(restored.removed_builtin_sounds(), removed);
+        for clip in restored.list() {
+            assert!(restored.remove(clip.id));
+        }
+        assert!(
+            Soundboard::with_removed_builtins(&restored.removed_builtin_sounds())
+                .list()
+                .is_empty()
+        );
     }
 
     #[test]

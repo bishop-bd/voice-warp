@@ -1,0 +1,22 @@
+FROM registry.fedoraproject.org/fedora:43
+
+# Build against the same C library as the installer runtime, rather than the host.
+RUN dnf install -y \
+        rust cargo gcc gcc-c++ make pkgconf-pkg-config \
+        libX11-devel libXcursor-devel libXi-devel libXrandr-devel libxcb-devel \
+        libxkbcommon-devel libxkbcommon-x11 wayland-devel \
+        mesa-libGL-devel mesa-libEGL-devel mesa-dri-drivers \
+        fontconfig freetype pulseaudio-utils pipewire pipewire-pulseaudio \
+        wireplumber dbus-daemon desktop-file-utils \
+    && dnf clean all
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY scripts/test-pipewire.sh ./scripts/test-pipewire.sh
+RUN cargo test --locked \
+    && cargo build --release --locked \
+    && target/release/voice-warp --help \
+    && target/release/voice-warp --render-demo /tmp/voice-warp-demo.wav
+
+CMD ["/build/target/release/voice-warp", "--help"]
