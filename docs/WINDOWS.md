@@ -30,7 +30,9 @@ For monitoring, select a separate physical headphone output in Voice Warp. Monit
 
 The voice presets and soundboard work with the native backend. Import your own WAV clips through **Soundboard → Import WAV** while stopped. Keys **1–9** play sounds and **Esc** stops them while the app window is focused. **Mute voice** leaves the soundboard audible; **Mute all** silences both.
 
-AI is optional and uses a separate local w-okada v1 RVC server and model. Follow [the AI setup guide](AI.md). The audio route remains the same: converted audio goes to the selected cable output. Models and inference software are not included in the Windows package.
+AI is optional. The app can now own a native Windows x64 worker, with CPU, NVIDIA CUDA, and partial ONNX/DirectML execution paths. The runtime package contains its interpreter/libraries, so inference does not require a separate w-okada server, Python installation, WSL, or Docker. **The trusted native download catalog is currently empty:** build and install an explicitly trusted candidate package using [native runtime packaging](AI-RUNTIME-PACKAGES.md), or keep the existing external w-okada v1 setup. Candidate builds and GPU paths still require clean-machine and hardware qualification; native Windows ROCm packaging remains pending.
+
+Follow [the AI setup guide](AI.md) for backend/device selection, model testing, diagnostics, and limitations. DirectML requires an ONNX voice and retains CPU stages. The audio route remains the same: converted audio goes to the selected cable output. Voice models and native runtime payloads are separate from the desktop ZIP.
 
 ## Build a Windows package
 
@@ -40,7 +42,7 @@ On Windows, install Rust's `x86_64-pc-windows-msvc` toolchain and Microsoft C++ 
 .\scripts\package-windows.ps1
 ```
 
-The script builds the locked release with a statically linked MSVC C runtime, then writes `dist/voice-warp-0.2.0-windows-x86_64.zip` and its SHA-256 file. The ZIP contains the executable, documentation, license, and an executable checksum. It does not require Rust or Visual Studio on the destination PC. Windows system libraries and a working graphics driver are still required. No virtual audio drivers are bundled or installed by the script.
+The script builds the locked release with a statically linked MSVC C runtime, then writes `dist/voice-warp-VERSION-windows-x86_64.zip` and its SHA-256 file. The ZIP contains the executable, documentation, license, and an executable checksum. It does not require Rust or Visual Studio on the destination PC. Windows system libraries and a working graphics driver are still required. No virtual audio drivers are bundled or installed by the script.
 
 To choose another artifact directory:
 

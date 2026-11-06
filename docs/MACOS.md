@@ -1,6 +1,6 @@
 # Voice Warp on macOS
 
-Voice Warp includes a native CoreAudio path for microphone capture and selected-device playback, shared Rust voice effects, the soundboard, and the optional local AI adapter. **The macOS build and live routing have not been verified on a Mac during this implementation.** CI is configured to compile and test macOS; its results must be checked after the workflow actually runs.
+Voice Warp includes a native CoreAudio path for microphone capture and selected-device playback, shared Rust voice effects, the soundboard, a managed native AI worker launcher, and the optional external AI adapter. **The macOS build and live routing have not been verified on a Mac during this implementation.** CI is configured to compile and test macOS; its results must be checked after the workflow actually runs.
 
 ## Build on your Mac
 
@@ -36,7 +36,9 @@ BlackHole routes audio between applications; it is a separate driver with its ow
 
 Use Voice Warp's separate monitoring selection for physical headphones if you want to hear the result. Keep it different from the BlackHole main output. Do not select BlackHole as Voice Warp's microphone input while also sending audio into it; that creates a feedback route.
 
-For AI conversion, configure a compatible local server/model using [the AI guide](AI.md). AI acceleration depends on the server's macOS runtime support; the Rust app does not supply model weights or an inference runtime.
+For AI conversion, the managed worker supports native CPU and Apple Silicon Metal/MPS execution paths. **The trusted native download catalog is currently empty.** A matching candidate runtime must first be built and installed using [native runtime packaging](AI-RUNTIME-PACKAGES.md), then tested on the target Mac. The resulting runtime does not require system Python or a separate w-okada server. The external adapter remains available for an existing working server.
+
+Apple Silicon and Intel packages are separate artifacts, and the AI runtime's minimum macOS version may exceed the desktop app's macOS 11 minimum. Intel CPU dependencies need qualification; Intel Mac AMD GPU support is not released, and current NVIDIA CUDA is unavailable on macOS. Metal can retain CPU stages, which the worker reports after model warmup. Follow [the AI guide](AI.md) for model setup, device checks, and current validation limits.
 
 ## Checks on a real Mac
 

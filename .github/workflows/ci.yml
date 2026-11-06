@@ -24,6 +24,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Test worker policy and native package integrity
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python engine/test_worker.py
+          python scripts/test_ai_runtime_package.py
       - name: Install Linux build and audio dependencies
         if: runner.os == 'Linux'
         run: |

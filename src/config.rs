@@ -19,6 +19,10 @@ pub struct Settings {
     pub rvc_index: PathBuf,
     pub rvc_pitch: i32,
     pub rvc_index_ratio: f32,
+    /// Requested runtime. The worker reports the effective backend separately.
+    pub rvc_backend: String,
+    /// Device identifier returned by the runtime probe, or its default index.
+    pub rvc_device: String,
     pub sound_paths: Vec<PathBuf>,
     /// Original bundled-sound names hidden from the user's library.
     pub removed_builtin_sounds: Vec<String>,
@@ -41,6 +45,8 @@ impl Default for Settings {
             rvc_index: PathBuf::new(),
             rvc_pitch: 0,
             rvc_index_ratio: 0.5,
+            rvc_backend: "cpu".into(),
+            rvc_device: "0".into(),
             sound_paths: Vec::new(),
             removed_builtin_sounds: Vec::new(),
             sound_volume: 0.75,
@@ -111,6 +117,8 @@ mod tests {
         assert_eq!(parsed.effects.chorus, 0.0);
         assert_eq!(parsed.effects.reverb, 0.0);
         assert_eq!(parsed.ai_block_size, 6144);
+        assert_eq!(parsed.rvc_backend, "cpu");
+        assert_eq!(parsed.rvc_device, "0");
         assert!(parsed.removed_builtin_sounds.is_empty());
     }
 
@@ -170,5 +178,17 @@ mod tests {
             restored.removed_builtin_sounds,
             settings.removed_builtin_sounds
         );
+    }
+
+    #[test]
+    fn device_preferences_preserve_explicit_external_server_choice() {
+        let parsed = Settings::from_json(
+            br#"{"ai_bundled":false,"rvc_backend":"cuda","rvc_device":"GPU-123"}"#,
+        )
+        .unwrap();
+        let restored = Settings::from_json(&serde_json::to_vec(&parsed).unwrap()).unwrap();
+        assert!(!restored.ai_bundled);
+        assert_eq!(restored.rvc_backend, "cuda");
+        assert_eq!(restored.rvc_device, "GPU-123");
     }
 }

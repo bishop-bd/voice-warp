@@ -37,14 +37,80 @@ enum Tab {
 
 enum Event {
     Devices(Result<(Vec<AudioDevice>, Vec<AudioDevice>), String>),
-    Started(Result<AudioEngine, String>),
+    Started {
+        generation: u64,
+        result: Result<AudioEngine, String>,
+    },
     Stopped,
-    Probed(Result<serde_json::Value, String>),
-    RvcInstalled(Result<(), String>),
-    RvcFile { index: bool, path: Option<PathBuf> },
-    ImportProgress { current: usize, total: usize },
+    Probed {
+        generation: u64,
+        result: Result<serde_json::Value, String>,
+    },
+    RvcInstalled {
+        generation: u64,
+        result: Result<(), String>,
+    },
+    AiDevices {
+        generation: u64,
+        result: Result<serde_json::Value, String>,
+    },
+    RvcFile {
+        index: bool,
+        path: Option<PathBuf>,
+    },
+    ImportProgress {
+        current: usize,
+        total: usize,
+    },
     Imported(Option<ImportReport>),
     Diagnostic(Result<serde_json::Value, String>),
+}
+
+#[derive(PartialEq)]
+struct AiSettingsKey {
+    bundled: bool,
+    endpoint: String,
+    backend: String,
+    device: String,
+    model: PathBuf,
+    index: PathBuf,
+    pitch: i32,
+    index_ratio: u32,
+    block_size: usize,
+}
+
+/// Keep canceled operations owned until their completion arrives. A generation
+/// prevents an old result from clearing a later operation or starting audio.
+#[derive(Default)]
+struct OperationControl {
+    generation: u64,
+    active: Option<(u64, Arc<AtomicBool>)>,
+}
+
+impl OperationControl {
+    fn begin(&mut self) -> (u64, Arc<AtomicBool>) {
+        self.cancel();
+        self.generation = self.generation.wrapping_add(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.active = Some((self.generation, stop.clone()));
+        (self.generation, stop)
+    }
+
+    fn cancel(&self) {
+        if let Some((_, stop)) = &self.active {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // None denotes an unrelated/stale result; false denotes canceled work.
+    fn finish(&mut self, generation: u64) -> Option<bool> {
+        if self.active.as_ref().map(|(id, _)| *id) != Some(generation) {
+            return None;
+        }
+        self.active
+            .take()
+            .map(|(_, stop)| !stop.load(Ordering::Relaxed))
+    }
 }
 
 #[derive(Default)]
@@ -104,6 +170,8 @@ pub struct VoiceWarpApp {
     busy: Option<String>,
     message: Option<(String, bool)>,
     ai_info: Option<serde_json::Value>,
+    ai_devices: Option<serde_json::Value>,
+    operation: OperationControl,
     diagnostics: Option<String>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
@@ -190,6 +258,8 @@ impl VoiceWarpApp {
             busy: None,
             message,
             ai_info: None,
+            ai_devices: None,
+            operation: OperationControl::default(),
             diagnostics: None,
             tx,
             rx,
@@ -286,6 +356,7 @@ impl VoiceWarpApp {
         let rvc_config = (self.use_ai && self.settings.ai_bundled).then(|| self.rvc_config());
         let mut engine = self.engine.take().unwrap_or_default();
         let tx = self.tx.clone();
+        let (generation, stop) = self.operation.begin();
         self.busy = Some("Connecting virtual microphone…".into());
         self.message = None;
         std::thread::spawn(move || {
@@ -295,7 +366,10 @@ impl VoiceWarpApp {
                     .map(|config| config.block_size)
                     .unwrap_or(960);
                 let ai: Option<Box<dyn Processor>> = if let Some(config) = rvc_config {
-                    Some(Box::new(RvcProcessor::new(config)?))
+                    Some(Box::new(RvcProcessor::new_cancellable(
+                        config,
+                        stop.clone(),
+                    )?))
                 } else if let Some(config) = ai_config {
                     let processor = AIProcessor::new(config)?;
                     processor.probe()?;
@@ -303,6 +377,9 @@ impl VoiceWarpApp {
                 } else {
                     None
                 };
+                if stop.load(Ordering::Relaxed) {
+                    return Err("Startup canceled.".into());
+                }
                 engine.start(
                     &source,
                     Box::new(MixProcessor::new(controls, board, ai)),
@@ -311,12 +388,17 @@ impl VoiceWarpApp {
                     monitor_sink.as_deref(),
                     output_device.as_deref(),
                 )?;
+                if stop.load(Ordering::Relaxed) {
+                    engine.stop();
+                    return Err("Startup canceled.".into());
+                }
                 Ok(engine)
             })();
-            let _ = tx.send(Event::Started(result));
+            let _ = tx.send(Event::Started { generation, result });
         });
     }
     fn stop(&mut self) {
+        self.cancel_operation();
         self.board.lock().unwrap().stop_all();
         if let Some(mut engine) = self.engine.take() {
             self.busy = Some("Disconnecting…".into());
@@ -334,17 +416,46 @@ impl VoiceWarpApp {
             timeout_secs: 3,
         }
     }
+    fn cancel_operation(&mut self) {
+        if self.operation.active.is_some() {
+            self.operation.cancel();
+            self.busy = Some("Canceling and releasing the AI worker…".into());
+        }
+    }
+
     fn probe(&mut self) {
+        if self.preview || self.live() || self.busy.is_some() {
+            return;
+        }
         let config = self.ai_config();
         let rvc_config = self.settings.ai_bundled.then(|| self.rvc_config());
         let tx = self.tx.clone();
-        self.busy = Some("Checking local AI engine…".into());
+        let (generation, stop) = self.operation.begin();
+        self.ai_info = None;
+        self.busy = Some("Loading and testing the selected voice…".into());
         std::thread::spawn(move || {
-            let _ = tx.send(Event::Probed(if let Some(config) = rvc_config {
-                RvcProcessor::new(config).map(|p| p.info.clone())
+            let result = if let Some(config) = rvc_config {
+                RvcProcessor::new_cancellable(config, stop).map(|p| p.info.clone())
             } else {
                 AIProcessor::new(config).and_then(|p| p.probe())
-            }));
+            };
+            let _ = tx.send(Event::Probed { generation, result });
+        });
+    }
+
+    fn probe_devices(&mut self) {
+        if self.preview || self.live() || self.busy.is_some() {
+            return;
+        }
+        let backend = self.settings.rvc_backend.clone();
+        let device = self.settings.rvc_device.clone();
+        let tx = self.tx.clone();
+        let (generation, stop) = self.operation.begin();
+        self.ai_devices = None;
+        self.busy = Some("Checking the installed AI runtime and devices…".into());
+        std::thread::spawn(move || {
+            let result = rvc::diagnostics(&backend, &device, stop);
+            let _ = tx.send(Event::AiDevices { generation, result });
         });
     }
     fn rvc_config(&self) -> RvcConfig {
@@ -354,6 +465,8 @@ impl VoiceWarpApp {
             pitch: self.settings.rvc_pitch,
             index_ratio: self.settings.rvc_index_ratio,
             block_size: self.settings.ai_block_size,
+            backend: self.settings.rvc_backend.clone(),
+            device: self.settings.rvc_device.clone(),
         }
     }
     fn choose_rvc_file(&mut self, index: bool) {
@@ -376,10 +489,19 @@ impl VoiceWarpApp {
         });
     }
     fn install_rvc(&mut self) {
+        if self.preview || self.live() || self.busy.is_some() {
+            return;
+        }
         let tx = self.tx.clone();
-        self.busy = Some("Installing AI engine. The first setup downloads several GB and can take several minutes…".into());
+        let backend = self.settings.rvc_backend.clone();
+        let (generation, stop) = self.operation.begin();
+        self.ai_info = None;
+        self.ai_devices = None;
+        self.busy =
+            Some("Installing the selected AI runtime. Setup can download several GB…".into());
         std::thread::spawn(move || {
-            let _ = tx.send(Event::RvcInstalled(rvc::install()));
+            let result = rvc::install_backend(&backend, stop);
+            let _ = tx.send(Event::RvcInstalled { generation, result });
         });
     }
     fn push_controls(&self) {
@@ -410,9 +532,48 @@ impl VoiceWarpApp {
     }
     fn events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
+            let generation = match &event {
+                Event::Started { generation, .. }
+                | Event::Probed { generation, .. }
+                | Event::RvcInstalled { generation, .. }
+                | Event::AiDevices { generation, .. } => Some(*generation),
+                _ => None,
+            };
+            if let Some(generation) = generation {
+                let accepted = self.operation.finish(generation);
+                if accepted == Some(false) || (accepted == Some(true) && self.closing) {
+                    // The final cancellation may race with successful audio startup.
+                    if let Event::Started {
+                        result: Ok(mut engine),
+                        ..
+                    } = event
+                    {
+                        self.busy = Some("Disconnecting canceled startup…".into());
+                        let tx = self.tx.clone();
+                        std::thread::spawn(move || {
+                            engine.stop();
+                            let _ = tx.send(Event::Stopped);
+                        });
+                    } else {
+                        self.busy = None;
+                        self.message = Some(("Operation canceled.".into(), false));
+                    }
+                    continue;
+                }
+                if accepted.is_none() {
+                    if let Event::Started {
+                        result: Ok(mut engine),
+                        ..
+                    } = event
+                    {
+                        std::thread::spawn(move || engine.stop());
+                    }
+                    continue;
+                }
+            }
             self.busy = None;
             match event {
-                Event::RvcInstalled(result) => {
+                Event::RvcInstalled { result, .. } => {
                     self.message = Some(match result {
                         Ok(()) => ("AI engine installed. Choose a voice model, then start your microphone.".into(), false),
                         Err(error) => (error, true),
@@ -470,7 +631,9 @@ impl VoiceWarpApp {
                         ));
                     }
                 }
-                Event::Started(Ok(engine)) => {
+                Event::Started {
+                    result: Ok(engine), ..
+                } => {
                     self.engine = Some(engine);
                     self.message = if let Some(error) = self.stats().error {
                         Some((error, true))
@@ -494,10 +657,22 @@ impl VoiceWarpApp {
                         false,
                     ));
                 }
-                Event::Probed(Ok(info)) => {
+                Event::Probed {
+                    result: Ok(info), ..
+                } => {
                     self.ai_info = Some(info);
                     self.message = Some((
                         "Local AI engine is ready. Choose AI mode, then start your microphone."
+                            .into(),
+                        false,
+                    ));
+                }
+                Event::AiDevices {
+                    result: Ok(info), ..
+                } => {
+                    self.ai_devices = Some(info);
+                    self.message = Some((
+                        "Device check finished. Test your selected voice before starting audio."
                             .into(),
                         false,
                     ));
@@ -522,8 +697,9 @@ impl VoiceWarpApp {
                     self.diagnostics = serde_json::to_string_pretty(&info).ok();
                 }
                 Event::Devices(Err(e))
-                | Event::Started(Err(e))
-                | Event::Probed(Err(e))
+                | Event::Started { result: Err(e), .. }
+                | Event::Probed { result: Err(e), .. }
+                | Event::AiDevices { result: Err(e), .. }
                 | Event::Diagnostic(Err(e)) => {
                     self.message = Some((e, true));
                 }
@@ -685,6 +861,9 @@ impl VoiceWarpApp {
                     && ui.small_button("Disconnect silent mic").clicked()
                 {
                     self.stop();
+                }
+                if self.operation.active.is_some() && ui.button("Cancel").clicked() {
+                    self.cancel_operation();
                 }
                 ui.add_space(5.0);
                 ui.vertical(|ui| {
@@ -1089,6 +1268,7 @@ impl VoiceWarpApp {
     }
 
     fn ai_page(&mut self, ui: &mut egui::Ui) {
+        let previous = self.ai_settings_signature();
         ui.add_space(18.0);
         card().show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1108,27 +1288,73 @@ impl VoiceWarpApp {
                 });
                 if self.settings.ai_bundled {
                     if rvc::supported() {
-                        if ui.button("Install / repair AI engine").clicked() { self.install_rvc(); }
-                        ui.label(RichText::new("One-time setup requires Podman and downloads the runtime and shared AI weights. Voice models are selected separately.").size(12.0).color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.label("Processing");
+                            egui::ComboBox::from_id_salt("rvc_backend")
+                                .selected_text(backend_label(&self.settings.rvc_backend))
+                                .show_ui(ui, |ui| {
+                                    for backend in ["cpu", "auto", "cuda", "rocm", "directml", "mps"] {
+                                        ui.add_enabled_ui(backend_for_platform(backend), |ui| {
+                                            if ui.selectable_value(&mut self.settings.rvc_backend, backend.into(), backend_label(backend)).changed() {
+                                                self.settings.rvc_device = "0".into();
+                                            }
+                                        });
+                                    }
+                                });
+                        });
+                        ui.label(RichText::new("GPU choices require a compatible runtime and driver. Auto selects within an installed runtime; a device check does not verify your voice model.").size(12.0).color(MUTED));
+                        if cfg!(target_os = "macos") {
+                            ui.label(RichText::new("Apple GPU acceleration uses Metal. Current NVIDIA CUDA is unavailable on macOS; Intel Mac GPU support is not qualified.").size(12.0).color(MUTED));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Install / repair AI engine").clicked() { self.install_rvc(); }
+                            if ui.button("Check available devices").clicked() { self.probe_devices(); }
+                        });
+                        ui.label(RichText::new(if cfg!(target_os = "linux") {
+                            "Setup requires Podman and downloads the selected runtime and shared weights. Voice models are selected separately."
+                        } else {
+                            "The managed runtime runs locally without a separate server or Python installation. A matching runtime package must be available for this platform."
+                        }).size(12.0).color(MUTED));
+                        ui.horizontal(|ui| {
+                            ui.label("Device ID");
+                            ui.add(egui::TextEdit::singleline(&mut self.settings.rvc_device).desired_width(200.0));
+                            if let Some(devices) = self.ai_devices.as_ref().and_then(|info| info["devices"].as_array()) {
+                                egui::ComboBox::from_id_salt("rvc_device")
+                                    .selected_text("Choose detected device")
+                                    .show_ui(ui, |ui| {
+                                        for device in devices {
+                                            if self.settings.rvc_backend != "auto"
+                                                && device["backend"].as_str().is_some_and(|backend| backend != self.settings.rvc_backend) {
+                                                continue;
+                                            }
+                                            if let Some(id) = device["id"].as_str() {
+                                                let name = device["name"].as_str().unwrap_or(id);
+                                                ui.selectable_value(&mut self.settings.rvc_device, id.to_string(), name);
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                        ui.label(RichText::new("Use a device ID from the runtime check; 0 selects its first device.").size(12.0).color(MUTED));
                         ui.horizontal(|ui| {
                             if ui.button("Choose voice model…").clicked() { self.choose_rvc_file(false); }
                             ui.label(self.settings.rvc_model.file_name().unwrap_or_default().to_string_lossy());
                         });
-                        ui.label(RichText::new("RVC .pth or .onnx. Choose files from a trusted model creator.").size(12.0).color(MUTED));
+                        ui.label(RichText::new("RVC .pth or compatible .onnx. Choose files from a trusted model creator.").size(12.0).color(MUTED));
                         ui.horizontal(|ui| {
                             if ui.button("Choose matching index…").clicked() { self.choose_rvc_file(true); }
                             if self.settings.rvc_index.as_os_str().is_empty() {
                                 ui.label("Optional");
                             } else {
                                 ui.label(self.settings.rvc_index.file_name().unwrap_or_default().to_string_lossy());
-                                if ui.small_button("Clear").clicked() { self.settings.rvc_index.clear(); self.ai_info = None; }
+                                if ui.small_button("Clear").clicked() { self.settings.rvc_index.clear(); }
                             }
                         });
                         ui.add(egui::Slider::new(&mut self.settings.rvc_pitch, -24..=24).text("Pitch (semitones)"));
                         ui.add_enabled(!self.settings.rvc_index.as_os_str().is_empty(),
                             egui::Slider::new(&mut self.settings.rvc_index_ratio, 0.0..=1.0).text("Index strength"));
                     } else {
-                        ui.label("Bundled AI is currently available on Linux x86-64. Use an external server on this platform.");
+                        ui.label("A managed AI runtime is not available for this operating system or architecture. External server compatibility remains available.");
                     }
                 } else {
                     ui.label("Compatible w-okada v1 server address (loopback only)");
@@ -1140,21 +1366,62 @@ impl VoiceWarpApp {
                         for size in [4096, 6144, 8192, 12288] { ui.selectable_value(&mut self.settings.ai_block_size, size, format!("{} samples / {:.0} ms", size, size as f32 / 48.0)); }
                     });
                 });
-                if ui.button("Test voice engine").clicked() { self.ai_info = None; self.probe(); }
+                if ui.button("Test voice engine").clicked() { self.probe(); }
             });
             if let Some(info) = &self.ai_info {
                 ui.add_space(8.0);
                 ui.label(RichText::new(format!("Last successful test: {}", info["model_name"].as_str().unwrap_or("RVC model"))).color(MINT));
-                ui.label(RichText::new(format!("Device: {} · 48 kHz · local inference", info["device"])).size(12.0).color(MUTED));
+                ui.label(RichText::new(format!("Device: {} · 48 kHz · local inference", info["device"].as_str().unwrap_or("Reported by server"))).size(12.0).color(MUTED));
+                if let Some(backend) = info["backend"].as_str() {
+                    ui.label(RichText::new(format!("Active processing: {backend}")).size(12.0).color(MUTED));
+                }
+                if let Some(version) = info["runtime_version"].as_str() {
+                    ui.label(RichText::new(format!("Runtime: {version}")).size(12.0).color(MUTED));
+                }
+                if let Some(stages) = info["stages"].as_object() {
+                    for (stage, placement) in stages {
+                        let placement = placement.as_str().map(str::to_owned).unwrap_or_else(|| placement.to_string());
+                        ui.label(RichText::new(format!("{stage}: {placement}")).size(12.0).color(MUTED));
+                    }
+                }
+                if let Some(reason) = info["fallback_reason"].as_str() {
+                    ui.label(RichText::new(reason).size(12.0).color(MUTED));
+                }
+            }
+            if let Some(info) = &self.ai_devices {
+                egui::CollapsingHeader::new("Runtime and device diagnostics").show(ui, |ui| {
+                    ui.monospace(serde_json::to_string_pretty(info).unwrap_or_default());
+                });
             }
         });
+        if previous != self.ai_settings_signature() {
+            self.ai_info = None;
+            // A backend change invalidates enumeration from the previous runtime.
+            if previous.backend != self.settings.rvc_backend {
+                self.ai_devices = None;
+            }
+        }
         ui.add_space(16.0);
         card().show(ui, |ui| {
             ui.label(RichText::new("Performance").size(17.0).strong());
-            ui.label("The bundled engine uses your CPU. Try 8192 or 12288 samples if audio stutters. Larger chunks increase latency. Stop the microphone before changing the voice or pitch.");
-            ui.label("Your microphone stays on this computer. Conversion errors stop AI audio.");
+            ui.label("Larger audio chunks improve throughput but add latency. GPU processing can still include CPU stages. Test the selected voice and check its actual device before starting a call.");
+            ui.label("Your microphone stays on this computer. Conversion errors stop AI audio. Explicit GPU selection never silently switches to CPU.");
             ui.label(RichText::new(format!("Setup and engine logs: {}", rvc::runtime_dir().display())).size(12.0).color(MUTED));
         });
+    }
+
+    fn ai_settings_signature(&self) -> AiSettingsKey {
+        AiSettingsKey {
+            bundled: self.settings.ai_bundled,
+            endpoint: self.settings.ai_endpoint.clone(),
+            backend: self.settings.rvc_backend.clone(),
+            device: self.settings.rvc_device.clone(),
+            model: self.settings.rvc_model.clone(),
+            index: self.settings.rvc_index.clone(),
+            pitch: self.settings.rvc_pitch,
+            index_ratio: self.settings.rvc_index_ratio.to_bits(),
+            block_size: self.settings.ai_block_size,
+        }
     }
 
     fn setup(&mut self, ui: &mut egui::Ui) {
@@ -1291,6 +1558,7 @@ impl eframe::App for VoiceWarpApp {
             self.closing = true;
         }
         if self.closing {
+            self.cancel_operation();
             if self.busy.is_some() || self.engine.is_some() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.busy.is_none() {
@@ -1407,10 +1675,33 @@ impl eframe::App for VoiceWarpApp {
 
 impl Drop for VoiceWarpApp {
     fn drop(&mut self) {
+        self.operation.cancel();
         if let Some(engine) = &mut self.engine {
             engine.stop();
         }
         self.save();
+    }
+}
+
+fn backend_label(backend: &str) -> &str {
+    match backend {
+        "cpu" => "CPU",
+        "auto" => "Auto (installed runtime)",
+        "cuda" => "NVIDIA · CUDA",
+        "rocm" => "AMD · ROCm",
+        "directml" => "Windows GPU · DirectML",
+        "mps" => "Apple GPU · Metal",
+        other => other,
+    }
+}
+
+fn backend_for_platform(backend: &str) -> bool {
+    match backend {
+        "cpu" | "auto" => true,
+        "cuda" | "rocm" => cfg!(any(target_os = "linux", target_os = "windows")),
+        "directml" => cfg!(target_os = "windows"),
+        "mps" => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        _ => false,
     }
 }
 
@@ -1502,6 +1793,24 @@ fn logo(ui: &mut egui::Ui, size: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canceled_or_stale_background_results_cannot_activate_a_session() {
+        let mut operation = OperationControl::default();
+        let (first, first_stop) = operation.begin();
+        operation.cancel();
+        assert!(first_stop.load(Ordering::Relaxed));
+        assert_eq!(operation.finish(first), Some(false));
+        assert!(operation.active.is_none());
+
+        let (second, second_stop) = operation.begin();
+        assert_ne!(first, second);
+        assert_eq!(operation.finish(first), None);
+        assert!(operation.active.is_some());
+        assert!(!second_stop.load(Ordering::Relaxed));
+        assert_eq!(operation.finish(second), Some(true));
+        assert_eq!(operation.finish(second), None);
+    }
 
     #[test]
     fn batch_import_continues_after_errors_and_reuses_duplicate_paths() {
