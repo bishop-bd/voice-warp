@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "macos-aarch64-coreml",
+  "os": "macos",
+  "arch": "aarch64",
+  "backend": "coreml",
+  "python": "3.12",
+  "minimum_os": "14.0",
+  "lock": "macos-aarch64-coreml.txt",
+  "requirements": [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "numba==0.61.2",
+    "resampy==0.4.3",
+    "onnx==1.19.1",
+    "faiss-cpu==1.12.0",
+    "soundfile==0.13.1",
+    "dataclasses-json==0.6.7",
+    "setuptools==80.9.0",
+    "pip==25.3",
+    "wheel==0.45.1",
+    "pyinstaller==6.16.0",
+    "torch @ https://files.pythonhosted.org/packages/6e/ab/07739fd776618e5882661d04c43f5b5586323e2f6a2d7d84aac20d8f20bd/torch-2.9.1-cp312-none-macosx_11_0_arm64.whl#sha256=c0d25d1d8e531b8343bea0ed811d5d528958f1dcbd37e7245bc686273177ad7e",
+    "torchaudio @ https://files.pythonhosted.org/packages/f1/83/71cbadd7b66753818b5775f2088bad4f721d581de276996df4968000a626/torchaudio-2.9.1-cp312-cp312-macosx_11_0_arm64.whl#sha256=7581ef170794c599aed55918e00d0acd9e5c9a0f19400c9a9a840955180365c5",
+    "onnxruntime==1.23.2"
+  ],
+  "qualification": "candidate; actual platform/model/hardware qualification required",
+  "sources": [
+    "https://pytorch.org/get-started/previous-versions/",
+    "https://onnxruntime.ai/docs/execution-providers/"
+  ],
+  "lock_sha256": "2a229f90a2bdd3c58622a2be0324f81485f79d0214a3315aa1ff319ce04fca7b"
+}

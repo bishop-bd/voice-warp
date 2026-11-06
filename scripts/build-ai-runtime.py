@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build a native, relocatable Voice Warp worker on its target OS.
 
-Build machines need Python 3.10, Git, and native compiler tools. End users only
+Build machines need Python 3.12, Git, and native compiler tools. End users only
 need the resulting package and Voice Warp. Artifacts are candidates until tested
 on the target hardware; this script does not publish them or modify the catalog.
 """
@@ -58,28 +58,12 @@ def host_target():
     return os_name, architecture
 
 
-def validate_backend(backend, os_name, architecture):
-    if backend in ("cuda", "directml") and os_name != "windows":
-        raise ValueError(f"The native {backend} package targets Windows x64.")
-    if backend == "mps" and (os_name, architecture) != ("macos", "aarch64"):
-        raise ValueError("This MPS package targets Apple Silicon; Intel/AMD Mac GPU support remains unqualified.")
-
-
-def dependencies(backend):
-    # Preserve the pinned inference baseline, changing only platform/provider
-    # constraints. pip freeze below records the fully resolved build inventory.
-    replacements = {
-        "faiss-cpu": "faiss-cpu==1.8.0",
-        "onnxruntime": {
-            "cuda": "onnxruntime-gpu==1.18.0",  # PyPI build: CUDA 11.8/cuDNN 8.
-            "directml": "onnxruntime-directml==1.17.3",
-        }.get(backend, "onnxruntime==1.17.3"),
-    }
-    lines = []
-    for line in (ROOT / "engine/requirements.txt").read_text().splitlines():
-        name = line.split("==")[0]
-        lines.append(replacements.get(name, line))
-    return "\n".join(lines) + "\n"
+def runtime_profile(backend, os_name, architecture):
+    name = f"{os_name}-{architecture}-{backend}"
+    path = ROOT / "engine/profiles" / f"{name}.json"
+    if not path.is_file():
+        raise ValueError(f"No reviewed native runtime profile exists for {name}.")
+    return json.loads(path.read_text())
 
 
 def fetch_asset(url, digest, destination):
@@ -89,16 +73,27 @@ def fetch_asset(url, digest, destination):
         raise ValueError(f"Shared asset checksum failed: {destination.name}")
 
 
+def probe_environment(executable):
+    environment = dict(os.environ)
+    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
+        environment.pop(key, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    # A successful frozen smoke must not discover the build venv's interpreter
+    # or compiler by PATH. Windows retains its OS DLL/tool directory only.
+    paths = [str(executable.parent)]
+    if os.name == "nt" and environment.get("SystemRoot"):
+        paths.append(str(Path(environment["SystemRoot"]) / "System32"))
+    environment["PATH"] = os.pathsep.join(paths)
+    return environment
+
+
 def probe(executable, backend, model=None, assets=None):
     request = {"protocol": 2, "action": "probe", "backend": backend, "device": "0"}
     if model:
         request.update(action="init", model_path=str(model.resolve()), index_path=None,
                        assets_dir=str(assets.resolve()), block_size=8192, pitch=0,
                        index_ratio=0.0)
-    environment = dict(os.environ)
-    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"):
-        environment.pop(key, None)
-    environment["PYTHONNOUSERSITE"] = "1"
+    environment = probe_environment(executable)
     if model:
         # Init/stream sessions own the worker through an open stdin pipe. Unlike
         # a one-shot probe, communicate(input=...) would close that pipe during
@@ -155,6 +150,40 @@ def probe(executable, backend, model=None, assets=None):
     if not model and not isinstance(response.get("devices"), list):
         raise RuntimeError("Frozen worker did not enumerate devices.")
     return response
+
+
+def export_smoke(executable, model, assets, cache):
+    """Exercise the frozen exporter and its PYZ module fingerprint on CPU."""
+    request = {"protocol": 2, "action": "export", "backend": "cpu", "device": "0",
+               "model_path": str(model.resolve()), "assets_dir": str(assets.resolve()),
+               "cache_dir": str(cache.resolve()), "include_hubert": False}
+    environment = probe_environment(executable)
+    with tempfile.TemporaryFile() as diagnostic:
+        process = subprocess.Popen([str(executable)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=diagnostic, text=True, env=environment, cwd=executable.parent)
+        lines = queue.Queue(maxsize=1)
+        try:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            threading.Thread(target=lambda: lines.put(process.stdout.readline(300_001)), daemon=True).start()
+            line = lines.get(timeout=300)
+            if len(line) > 300_000 or not line.endswith("\n"):
+                raise RuntimeError("Frozen exporter returned an invalid frame")
+            response = json.loads(line)
+            if response.get("protocol") != 2 or response.get("exported") is not True or response.get("cpu_validated") is not True:
+                raise RuntimeError(f"Frozen exporter failed CPU parity validation: {response}")
+            process.wait(timeout=10)
+            if process.returncode:
+                raise RuntimeError("Frozen exporter exited unsuccessfully")
+            return response
+        except Exception as error:
+            process.kill()
+            process.wait()
+            diagnostic.seek(0)
+            raise RuntimeError(f"Frozen export failed: {error}\n{diagnostic.read().decode('utf-8', errors='replace')[-12000:]}") from error
+        finally:
+            process.stdin.close()
+            process.stdout.close()
 
 
 def archive_payload(payload, archive_path):
@@ -222,11 +251,11 @@ def extract_verified_payload(archive_path, destination, inventory):
 
 def build(args):
     os_name, architecture = host_target()
-    validate_backend(args.backend, os_name, architecture)
-    if sys.version_info[:2] != (3, 10):
-        raise ValueError("Build with Python 3.10 to match the qualified candidate dependency ABI.")
-    if not args.build_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in args.build_id):
-        raise ValueError("--build-id must contain only letters, digits, hyphens, or underscores.")
+    profile = runtime_profile(args.backend, os_name, architecture)
+    if sys.version_info[:2] != (3, 12):
+        raise ValueError("Build with Python 3.12 to match the pinned runtime profile ABI.")
+    if not args.build_id or len(args.build_id) > 160 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in args.build_id):
+        raise ValueError("--build-id must contain 1–160 letters, digits, hyphens, or underscores.")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     work_root = ROOT / "target/ai-runtime-build"
@@ -241,37 +270,30 @@ def build(args):
         environment = work / "venv"
         venv.EnvBuilder(with_pip=True).create(environment)
         python = environment / ("Scripts/python.exe" if os_name == "windows" else "bin/python")
-        run(python, "-m", "pip", "install", "pip==24.0", "wheel==0.45.1", "setuptools==70.3.0")
-        torch_command = [python, "-m", "pip", "install", "torch==2.2.2", "torchaudio==2.2.2"]
-        if os_name == "windows":
-            torch_command += ["--index-url", "https://download.pytorch.org/whl/" + ("cu118" if args.backend == "cuda" else "cpu")]
-        run(*torch_command)
-        requirements = work / "requirements.txt"
-        requirements.write_text(dependencies(args.backend))
-        run(python, "-m", "pip", "install", "-r", requirements)
-        run(python, "-m", "pip", "install", "pyinstaller==6.11.1", "pyinstaller-hooks-contrib==2024.10")
-        run(python, "-m", "pip", "check")
-        hooks = work / "hooks"
-        hooks.mkdir()
-        # Fairseq registration imports modules dynamically and inspect needs source.
-        (hooks / "hook-fairseq.py").write_text(
-            "from PyInstaller.utils.hooks import collect_all\n"
-            "datas, binaries, hiddenimports = collect_all('fairseq')\n"
-            "module_collection_mode = 'pyz+py'\n"
-        )
+        install_command = [python, ROOT / "engine/install_profile.py", profile["id"]]
+        if args.wheel_cache:
+            install_command += ["--wheel-cache", args.wheel_cache.resolve()]
+        run(*install_command)
         command = [python, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir",
                    "--name", "voice-warp-worker", "--distpath", work / "frozen",
                    "--workpath", work / "pyinstaller", "--specpath", work,
-                   "--additional-hooks-dir", hooks, "--paths", source / "server",
-                   "--paths", ROOT / "engine", "--collect-submodules", "voice_changer.RVC",
-                   "--collect-submodules", "voice_changer.common", "--collect-submodules", "data",
-                   "--collect-submodules", "mods", "--collect-all", "onnxruntime",
-                   "--collect-all", "faiss", "--collect-all", "torchcrepe",
-                   "--collect-all", "torchfcpe", "--collect-all", "librosa",
-                   "--collect-all", "scipy", "--collect-all", "numba"]
+                   "--paths", source / "server", "--paths", ROOT / "engine",
+                   "--collect-submodules", "voice_changer.RVC.inferencer.rvc_models",
+                   "--hidden-import", "voice_changer.RVC.RVCSettings",
+                   "--hidden-import", "Exceptions", "--hidden-import", "export_models",
+                   "--hidden-import", "voice_warp_hubert", "--hidden-import", "voice_warp_rvc",
+                   "--hidden-import", "voice_warp_checkpoint"]
+        for package in ("onnxruntime", "faiss", "scipy", "numba", "llvmlite", "resampy", "torchaudio"):
+            command += ["--collect-all", package]
+        if args.backend == "rocm":
+            # AMD's loader discovers libraries relative to these package roots.
+            # Preserve both SDK metadata and private native-library directories.
+            for package in ("rocm_sdk", "rocm_sdk_core", "rocm_sdk_libraries_custom",
+                            "_rocm_sdk_core", "_rocm_sdk_libraries_custom"):
+                command += ["--collect-all", package]
         identity = os.environ.get("VOICE_WARP_CODESIGN_IDENTITY")
         if identity and os_name == "macos":
-            command += ["--codesign-identity", identity]
+            command += ["--codesign-identity", identity, "--osx-entitlements-file", ROOT / "packaging/runtime-entitlements.plist"]
         command.append(ROOT / "engine/worker.py")
         run(*command)
         payload = work / "frozen/voice-warp-worker"
@@ -287,6 +309,8 @@ def build(args):
             shutil.copy2(ROOT / "engine" / name, notices / name)
         shutil.copy2(ROOT / "LICENSE", notices / "VOICE-WARP-LICENSE")
         shutil.copytree(source / "server", notices / "upstream-server", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copy2(ROOT / "engine/profiles" / f'{profile["id"]}.json', notices / "runtime-profile.json")
+        shutil.copy2(ROOT / "engine/locks" / profile["lock"], notices / "requirements.lock")
         freeze = subprocess.check_output([str(python), "-m", "pip", "freeze"], text=True)
         (notices / "requirements-resolved.txt").write_text(freeze)
         # Copy installed distribution metadata, including license files bundled by wheels.
@@ -299,9 +323,23 @@ def build(args):
             run("signtool", "sign", "/sha1", os.environ["VOICE_WARP_WINDOWS_CERT_SHA1"],
                 "/fd", "SHA256", "/tr", "http://timestamp.digicert.com", "/td", "SHA256", executable)
             run("signtool", "verify", "/pa", executable)
+        fixture = work / "synthetic-packaging-test.pth"
+        run(python, ROOT / "scripts/create-runtime-fixture.py", fixture, "--upstream-server", source / "server")
+        packages = json.loads(subprocess.check_output([
+            str(python), "-c", "import importlib.metadata,json; print(json.dumps({d.metadata['Name']:d.version for d in importlib.metadata.distributions()}))"
+        ], text=True))
+        # Prove the frozen worker does not depend on its build environment, and
+        # avoid retaining two large CUDA/ROCm library trees during ZIP checking.
+        if environment.is_symlink():
+            environment.unlink()
+        else:
+            shutil.rmtree(environment)
+        shutil.rmtree(source)
+        shutil.rmtree(work / "pyinstaller")
         response = probe(executable, args.backend)
+        fixture_result = probe(executable, "cpu", fixture, assets)
         model_result = probe(executable, args.backend, args.smoke_model, assets) if args.smoke_model else None
-        (payload / "build-verification.json").write_text(json.dumps({"probe": response, "model_warmup": model_result}, indent=2) + "\n")
+        (payload / "build-verification.json").write_text(json.dumps({"probe": response, "synthetic_cpu_warmup": fixture_result, "model_warmup": model_result}, indent=2) + "\n")
         # Relocation is a required packaging check, even without a GPU/model fixture.
         moved = work / "relocated worker é"
         shutil.move(str(payload), moved)
@@ -314,6 +352,10 @@ def build(args):
         unpacked = work / "archive verification é"
         extract_verified_payload(archive_path, unpacked, inventory)
         probe(unpacked / executable_name, args.backend)
+        probe(unpacked / executable_name, "cpu", fixture, unpacked / "assets")
+        export_result = export_smoke(unpacked / executable_name, fixture, unpacked / "assets", work / "frozen-export-cache")
+        if not Path(export_result["voice_model"]).is_file():
+            raise RuntimeError("Frozen export did not produce its validated ONNX voice")
         if args.smoke_model:
             probe(unpacked / executable_name, args.backend, args.smoke_model, unpacked / "assets")
         if os_name == "macos" and identity:
@@ -326,35 +368,33 @@ def build(args):
         if os_name == "macos" and os.environ.get("VOICE_WARP_NOTARY_PROFILE"):
             run("xcrun", "notarytool", "submit", archive_path, "--keychain-profile",
                 os.environ["VOICE_WARP_NOTARY_PROFILE"], "--wait")
-        packages = {}
-        for line in freeze.splitlines():
-            if "==" in line:
-                name, version = line.split("==", 1)
-                packages[name] = version
         manifest = {
             "schema": 1, "protocol": 2, "id": args.build_id, "version": args.runtime_version,
             "os": os_name, "arch": architecture, "backend": args.backend,
-            "minimum_os": "10.0.18362" if os_name == "windows" else "12.3" if args.backend == "mps" else "11.0",
+            "minimum_os": profile["minimum_os"], "profile": profile["id"],
+            "profile_lock_sha256": profile["lock_sha256"],
+            "minimum_driver": profile.get("minimum_driver"),
             "executable": executable_name, "assets_dir": "assets", "archive": archive_name,
             "archive_sha256": sha256(archive_path), "archive_bytes": archive_path.stat().st_size,
             "unpacked_bytes": total, "files": inventory, "packages": packages,
             "upstream_revision": UPSTREAM,
-            "qualification": "build/probe/relocation/final ZIP probe only; hardware and speech qualification required" if not model_result else "build/probe/relocation/final ZIP model warmup only; speech qualification required",
+            "qualification": "synthetic CPU inference/export and final ZIP verification only; hardware and speech qualification required" if not model_result else "build/probe/relocation/final ZIP model warmup only; speech qualification required",
         }
         manifest_path = output / f"{args.build_id}.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         digest = sha256(manifest_path)
         (output / f"{args.build_id}.json.sha256").write_text(f"{digest}  {manifest_path.name}\n")
         print(f"Runtime package: {archive_path}\nManifest: {manifest_path}\nManifest SHA-256: {digest}")
-        print("Candidate package only. Qualify hardware/speech, review redistribution terms, then add its manifest URL/hash to engine/runtime-catalog.json before rebuilding the signed app.")
+        print("Candidate package only. Qualify hardware/speech, review redistribution terms, then use assemble-ai-release.py to bundle its trusted manifest before rebuilding the signed app.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("cpu", "cuda", "mps", "directml"), required=True)
+    parser.add_argument("--backend", choices=("cpu", "cuda", "rocm", "mps", "coreml", "directml"), required=True)
     parser.add_argument("--build-id", required=True, help="Unique immutable package ID, e.g. windows-x64-cpu-2-20261105")
-    parser.add_argument("--runtime-version", default="2.0.0")
+    parser.add_argument("--runtime-version", default="3.0.0")
     parser.add_argument("--output", type=Path, default=ROOT / "dist/ai-runtimes")
+    parser.add_argument("--wheel-cache", type=Path, help="Optional local vendor wheel cache; all bytes remain hash-verified")
     parser.add_argument("--smoke-model", type=Path, help="Trusted licensed model for actual inference warmup")
     args = parser.parse_args()
     build(args)

@@ -4,7 +4,7 @@ Voice Warp includes a native CoreAudio path for microphone capture and selected-
 
 ## Build on your Mac
 
-Install Xcode Command Line Tools and Rust on the Mac, then run from a source checkout:
+Install Xcode Command Line Tools, Rust, and Python 3.10 or newer (`python3` on `PATH`) on the Mac, then run from a source checkout. Python verifies the packaged runtime catalog; users of the finished app do not need it. Building AI runtime packages requires Python 3.12.
 
 ```bash
 bash scripts/package-macos.sh
@@ -36,9 +36,9 @@ BlackHole routes audio between applications; it is a separate driver with its ow
 
 Use Voice Warp's separate monitoring selection for physical headphones if you want to hear the result. Keep it different from the BlackHole main output. Do not select BlackHole as Voice Warp's microphone input while also sending audio into it; that creates a feedback route.
 
-For AI conversion, the managed worker supports native CPU and Apple Silicon Metal/MPS execution paths. **The trusted native download catalog is currently empty.** A matching candidate runtime must first be built and installed using [native runtime packaging](AI-RUNTIME-PACKAGES.md), then tested on the target Mac. The resulting runtime does not require system Python or a separate w-okada server. The external adapter remains available for an existing working server.
+For AI conversion, the managed worker supports native CPU, Apple Silicon Metal/MPS, and ONNX/Core ML execution paths. **The source catalog has no published native downloads yet.** The native workflow can build an offline app distribution containing authenticated runtime packages. Source-only builds can import a matching candidate using [native runtime packaging](AI-RUNTIME-PACKAGES.md); either path still requires validation on the target Mac. The resulting runtime does not require system Python or a separate w-okada server. The external adapter remains available for an existing working server.
 
-Apple Silicon and Intel packages are separate artifacts, and the AI runtime's minimum macOS version may exceed the desktop app's macOS 11 minimum. Intel CPU dependencies need qualification; Intel Mac AMD GPU support is not released, and current NVIDIA CUDA is unavailable on macOS. Metal can retain CPU stages, which the worker reports after model warmup. Follow [the AI guide](AI.md) for model setup, device checks, and current validation limits.
+Apple Silicon and Intel packages are separate artifacts, and the AI runtime's minimum macOS version may exceed the desktop app's macOS 11 minimum. Current runtime profiles require macOS 14 on Apple Silicon or macOS 13 on Intel. Intel CPU/Core ML dependencies need qualification; Intel Mac AMD GPU support is experimental, and current NVIDIA CUDA is unavailable on macOS. Metal can retain CPU stages, which the worker reports after model warmup. Core ML requests CPU-and-GPU execution but does not claim verified internal GPU placement. Follow [the AI guide](AI.md) for model setup, device checks, and current validation limits.
 
 ## Checks on a real Mac
 

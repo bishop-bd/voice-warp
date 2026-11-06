@@ -90,7 +90,7 @@ class RuntimePackageTests(unittest.TestCase):
                                                 ("directml", "macos", "x86_64"),
                                                 ("mps", "macos", "x86_64")]:
             with self.assertRaises(ValueError):
-                builder.validate_backend(backend, system, architecture)
+                builder.runtime_profile(backend, system, architecture)
 
 
 if __name__ == "__main__":

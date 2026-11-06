@@ -6,36 +6,40 @@ validation and device selection can be tested without a GPU or model weights.
 from contextlib import contextmanager
 from pathlib import Path
 import json
+import hashlib
 import math
 import platform
 import tempfile
 
 PROTOCOL = 2
-RUNTIME_VERSION = "2.0.0"
-BACKENDS = ("auto", "cpu", "cuda", "rocm", "mps", "directml")
+RUNTIME_VERSION = "3.0.0"
+BACKENDS = ("auto", "cpu", "cuda", "rocm", "mps", "directml", "coreml", "migraphx")
 BLOCK_SIZES = (4096, 6144, 8192, 12288)
 
 
 def validate_request(config):
     if not isinstance(config, dict) or config.get("protocol") != PROTOCOL:
         raise ValueError("Incompatible AI worker protocol; repair the AI runtime")
-    if config.get("action") not in ("probe", "init"):
-        raise ValueError("Expected an init or probe request")
+    if config.get("action") not in ("probe", "init", "export"):
+        raise ValueError("Expected an init, probe, or export request")
     if config.get("backend", "cpu") not in BACKENDS:
         raise ValueError("Unknown AI backend")
     if not isinstance(config.get("device", "0"), str):
         raise ValueError("AI device must be an identifier string")
     if config["action"] == "probe":
         return
-    block = config.get("block_size")
-    if type(block) is not int or block not in BLOCK_SIZES:
-        raise ValueError("Unsupported audio block size")
-    pitch = config.get("pitch")
-    if type(pitch) is not int or not -24 <= pitch <= 24:
-        raise ValueError("Pitch must be between -24 and 24 semitones")
-    ratio = config.get("index_ratio")
-    if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
-        raise ValueError("Index strength must be finite and between 0 and 1")
+    if config["action"] == "init":
+        if type(config.get("measure_performance", False)) is not bool:
+            raise ValueError("measure_performance must be a boolean")
+        block = config.get("block_size")
+        if type(block) is not int or block not in BLOCK_SIZES:
+            raise ValueError("Unsupported audio block size")
+        pitch = config.get("pitch")
+        if type(pitch) is not int or not -24 <= pitch <= 24:
+            raise ValueError("Pitch must be between -24 and 24 semitones")
+        ratio = config.get("index_ratio")
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+            raise ValueError("Index strength must be finite and between 0 and 1")
     for key, suffixes in (("model_path", (".pth", ".onnx")), ("index_path", (".index",))):
         value = config.get(key)
         if key == "index_path" and not value:
@@ -49,8 +53,92 @@ def validate_request(config):
     if not isinstance(assets, str) or not Path(assets).is_absolute():
         raise ValueError("assets_dir must be an absolute directory")
     for name in ("hubert_base.pt", "rmvpe.onnx"):
-        if not (Path(assets) / name).is_file():
+        override = config.get("hubert_path" if name == "hubert_base.pt" else "rmvpe_path")
+        if config["action"] == "init" and override:
+            if not isinstance(override, str) or not Path(override).is_absolute() or not Path(override).is_file() or Path(override).suffix != ".onnx":
+                raise ValueError("Exported stage paths must be existing absolute ONNX files")
+        elif not (Path(assets) / name).is_file():
             raise ValueError(f"Missing shared AI asset {name}; repair the AI runtime")
+    if config["action"] == "export":
+        cache = config.get("cache_dir")
+        if not isinstance(cache, str) or not Path(cache).is_absolute():
+            raise ValueError("Export cache_dir must be an absolute directory")
+        if type(config.get("include_hubert", True)) is not bool:
+            raise ValueError("include_hubert must be a boolean")
+
+
+def exported_bundle_paths(config):
+    """Resolve only a verified Voice Warp export bundle beside its voice graph."""
+    if config.get("action") != "init" or not isinstance(config.get("model_path"), str):
+        return config
+    model = Path(config["model_path"])
+    manifest_path = model.parent / "export.json"
+    if model.name != "voice.onnx" or not manifest_path.is_file():
+        return config
+    if manifest_path.stat().st_size > 100_000:
+        raise ValueError("Export manifest is oversized")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1 or manifest.get("cpu_validated") is not True:
+        raise ValueError("Export bundle has not passed CPU validation")
+    files = manifest.get("files", {})
+    if not isinstance(files, dict) or not {"voice.onnx", "rmvpe.onnx"}.issubset(files):
+        raise ValueError("Incomplete export bundle")
+    for name, expected in files.items():
+        if name not in ("voice.onnx", "hubert.onnx", "rmvpe.onnx"):
+            raise ValueError("Unknown file in export bundle")
+        path = model.parent / name
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected:
+            raise ValueError(f"Export bundle checksum mismatch: {name}")
+    resolved = dict(config)
+    if "hubert.onnx" in files and not resolved.get("hubert_path"):
+        resolved["hubert_path"] = str(model.parent / "hubert.onnx")
+    if not resolved.get("rmvpe_path"):
+        resolved["rmvpe_path"] = str(model.parent / "rmvpe.onnx")
+    return resolved
+
+
+def verify_acceleration(backend, stages):
+    """Provider policies alone do not prove physical GPU work on Core ML.
+
+    ROCm/MPS can run Torch stages while their ONNX runtime is CPU-only. A fully
+    exported bundle in that runtime must not be advertised as accelerated just
+    because a small intermediate tensor was allocated on the GPU.
+    """
+    if backend in ("cpu", "coreml"):
+        return False
+    gpu_markers = ("cuda", "mps", "CUDAExecutionProvider", "DmlExecutionProvider",
+                   "MIGraphXExecutionProvider")
+    verified = any(str(stages.get(stage, "")).startswith(gpu_markers)
+                   for stage in ("hubert", "synthesizer"))
+    if not verified:
+        raise RuntimeError(f"The {backend} runtime executed no HuBERT or voice synthesis on the GPU; choose CPU or a compatible GPU runtime")
+    return True
+
+
+def configure_torch_policy(torch, selected):
+    """Apply only the locally verified workaround for this exact ROCm target.
+
+    ROCm 7.2.1's gfx1150 MIOpen convolution selection falls back to slow naive
+    kernels. PyTorch's native ATen convolutions still execute on this GPU. This
+    is not a hardware-identity override, precision reduction, or CPU fallback.
+    See docs/AI-COMPATIBILITY.md for measured parity and upstream issue links.
+    """
+    policy = {"convolution": "framework default"}
+    if (selected["backend"] != "rocm" or platform.system() != "Linux"
+            or not torch.__version__.startswith("2.9.1+rocm7.2.1.")):
+        return policy
+    properties = torch.cuda.get_device_properties(selected["index"])
+    architecture = str(getattr(properties, "gcnArchName", "")).split(":", 1)[0]
+    if architecture != "gfx1150":
+        return policy
+    torch.backends.cudnn.enabled = False
+    return {"convolution": "ATen GPU", "architecture": architecture,
+            "reason": "ROCm 7.2.1 gfx1150 MIOpen convolution workaround",
+            "cpu_fallback": False}
 
 
 def directml_adapters():
@@ -127,6 +215,11 @@ def discover_devices(torch, ort):
     if mps is not None and mps.is_available():
         devices.append({"backend": "mps", "id": "mps", "name": "Metal GPU (MPS)", "index": 0})
     providers = ort.get_available_providers()
+    if "MIGraphXExecutionProvider" in providers:
+        devices.extend([{**device, "backend": "migraphx"} for device in devices if device["backend"] == "rocm"])
+    if platform.system() == "Darwin" and "CoreMLExecutionProvider" in providers:
+        devices.append({"backend": "coreml", "id": "coreml", "index": 0,
+                        "name": "Core ML (CPU/GPU compute policy)", "gpu_verified": False})
     if platform.system() == "Windows" and "DmlExecutionProvider" in providers:
         try:
             devices.extend(directml_adapters())
@@ -144,7 +237,7 @@ def select_device(report, backend, identity="0", model_suffix=None):
     if backend == "auto":
         devices = sorted(devices, key=lambda d: (d["backend"] == "cpu", d["backend"] == "directml"))
         # The DirectML lane requires an ONNX voice model, not arbitrary checkpoints.
-        devices = [d for d in devices if d["backend"] != "directml" or model_suffix == ".onnx"]
+        devices = [d for d in devices if d["backend"] not in ("directml", "coreml", "migraphx") or model_suffix == ".onnx"]
         if identity not in ("", "0", "auto"):
             devices = [d for d in devices if d["id"] == identity]
             if len(devices) > 1:
@@ -152,10 +245,10 @@ def select_device(report, backend, identity="0", model_suffix=None):
         if not devices:
             raise ValueError("The saved AI device is no longer available; select a device again")
         return devices[0]
-    if backend == "directml" and model_suffix not in (None, ".onnx"):
-        raise ValueError("DirectML currently requires an RVC ONNX model; HuBERT runs on CPU")
+    if backend in ("directml", "coreml", "migraphx") and model_suffix not in (None, ".onnx"):
+        raise ValueError(f"{backend} requires an RVC ONNX model; export the voice first")
     candidates = [d for d in devices if d["backend"] == backend]
-    if backend in ("cpu", "mps") and identity in ("", "0", "auto", backend):
+    if backend in ("cpu", "mps", "coreml") and identity in ("", "0", "auto", backend):
         matches = candidates
     elif identity.isdecimal():
         matches = [d for d in candidates if d["index"] == int(identity)]
@@ -172,13 +265,19 @@ class ExplicitDeviceManager:
         self.torch = torch
         self.selected = selected
         backend = selected["backend"]
-        self.device = torch.device("cuda", selected["index"]) if backend in ("cuda", "rocm") else torch.device("mps" if backend == "mps" else "cpu")
+        self.device = torch.device("cuda", selected["index"]) if backend in ("cuda", "rocm", "migraphx") else torch.device("mps" if backend == "mps" else "cpu")
         available = ort.get_available_providers()
         self.provider = "CPUExecutionProvider"
         if backend == "cuda" and "CUDAExecutionProvider" in available:
             self.provider = "CUDAExecutionProvider"
-        elif backend == "rocm" and "MIGraphXExecutionProvider" in available:
+        elif backend == "migraphx":
+            if "MIGraphXExecutionProvider" not in available:
+                raise RuntimeError("This runtime does not include MIGraphX")
             self.provider = "MIGraphXExecutionProvider"
+        elif backend == "coreml":
+            if "CoreMLExecutionProvider" not in available:
+                raise RuntimeError("This runtime does not include Core ML")
+            self.provider = "CoreMLExecutionProvider"
         elif backend == "directml":
             if "DmlExecutionProvider" not in available:
                 raise RuntimeError("This runtime does not include DirectML")
@@ -187,8 +286,24 @@ class ExplicitDeviceManager:
     def getDevice(self, _index):
         return self.device
 
+    @contextmanager
+    def onnx_stage(self, stage):
+        # The pinned RMVPE graph spends minutes compiling in MIGraphX on the
+        # tested target. Keep this known CPU stage explicit; HuBERT/synthesis
+        # still require measured MIGraphX kernels before ready is returned.
+        original = self.provider
+        if self.selected["backend"] == "migraphx" and stage == "pitch":
+            self.provider = "CPUExecutionProvider"
+        try:
+            yield
+        finally:
+            self.provider = original
+
     def getOnnxExecutionProvider(self, _index):
         options = {} if self.provider == "CPUExecutionProvider" else {"device_id": str(self.selected["index"])}
+        if self.provider == "CoreMLExecutionProvider":
+            options = {"MLComputeUnits": "CPUAndGPU", "ModelFormat": "MLProgram",
+                       "RequireStaticInputShapes": "0", "EnableOnSubgraphs": "1"}
         return [self.provider], [options]
 
     def halfPrecisionAvailable(self, _index):
@@ -227,6 +342,12 @@ class OnnxAudit:
             options.execution_mode = self.ort.ExecutionMode.ORT_SEQUENTIAL
             if requested == "DmlExecutionProvider":
                 options.enable_mem_pattern = False
+            if requested == "MIGraphXExecutionProvider":
+                # ORT 1.23.2 constant-folds RVC's empty shape vectors into
+                # zero-length initializers that MIGraphX 2.15 reads as scalars,
+                # breaking Concat rank checks. MIGraphX performs its own graph
+                # optimization after parsing the original valid ONNX graph.
+                options.graph_optimization_level = self.ort.GraphOptimizationLevel.ORT_DISABLE_ALL
             if requested != "CPUExecutionProvider":
                 options.enable_profiling = True
                 options.profile_file_prefix = str(Path(self.temporary.name) / f"stage-{len(self.records)}")
@@ -260,6 +381,8 @@ class OnnxAudit:
         providers.discard(None)
         if requested not in providers:
             raise RuntimeError(f"Warmup executed no kernels on {requested}; GPU use was not verified")
+        if requested == "CoreMLExecutionProvider":
+            return "CoreMLExecutionProvider (CPUAndGPU policy; physical GPU use not measured)" + (" + CPU nodes" if "CPUExecutionProvider" in providers else "")
         return requested + (" + CPU nodes" if "CPUExecutionProvider" in providers else "")
 
     def close(self):

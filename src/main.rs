@@ -4,6 +4,7 @@ mod app;
 
 use std::{
     fs::{self, OpenOptions},
+    io::Write,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -12,10 +13,10 @@ use std::{
     time::{Duration, Instant},
 };
 use voice_warp::{
-    audio::{AudioEngine, Processor},
+    audio::AudioEngine,
     config::{Settings, config_dir},
     dsp::{LiveControls, MixProcessor, PRESETS, VoiceDsp},
-    rvc::{self, RvcConfig, RvcProcessor},
+    rvc::{self, RvcConfig},
     soundboard::Soundboard,
 };
 
@@ -76,7 +77,7 @@ fn run() -> Result<(), String> {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "Voice Warp {}\n\nvoice-warp                       Open the desktop app\nvoice-warp --doctor [--report FILE] Check audio devices without recording\nvoice-warp --list-inputs         Print available microphone IDs\nvoice-warp --list-outputs        Print available playback IDs\nvoice-warp --headless --input ID [--output ID] [--seconds 10] [--preset 0..{}]\nvoice-warp --render-demo FILE    Write an offline DSP + soundboard WAV\nvoice-warp --install-ai [--ai-backend cpu|cuda|rocm|mps|directml]\nvoice-warp --ai-doctor [--ai-backend cpu] [--ai-device 0]\nvoice-warp --ai-devices [--ai-backend cpu]\nvoice-warp --ai-benchmark --model FILE [--ai-backend cpu] [--blocks 64]\n  AI diagnostics/benchmark never open the microphone. Benchmark uses a generated tone.\n  Optional native package install: --install-ai --ai-runtime-manifest FILE --ai-manifest-sha256 HASH\nvoice-warp --ai-rollback --ai-backend cpu    Restore the previous native runtime\nvoice-warp --ai-remove-runtime BUILD_ID     Remove an inactive native runtime build\n  Benchmark options: --index FILE --block-size 8192 --pitch 0 --index-ratio 0.5 --ai-device ID\nvoice-warp --preview             Inspect the UI without opening audio streams\n\nLinux creates a Voice Warp source automatically. Windows/macOS require a separately installed virtual cable; select its playback endpoint with --output.",
+            "Voice Warp {}\n\nvoice-warp                       Open the desktop app\nvoice-warp --doctor [--report FILE] Check audio devices without recording\nvoice-warp --list-inputs         Print available microphone IDs\nvoice-warp --list-outputs        Print available playback IDs\nvoice-warp --headless --input ID [--output ID] [--seconds 10] [--preset 0..{}]\nvoice-warp --render-demo FILE    Write an offline DSP + soundboard WAV\nvoice-warp --install-ai [--ai-backend cpu|cuda|rocm|migraphx|mps|coreml|directml]\nvoice-warp --ai-doctor [--ai-backend cpu] [--ai-device 0]\nvoice-warp --ai-devices [--ai-backend cpu]\nvoice-warp --ai-export --model FILE [--ai-backend cpu]    Create a validated ONNX bundle\nvoice-warp --ai-benchmark --model FILE [--ai-backend cpu] [--blocks 64]\n  AI diagnostics/benchmark never open the microphone. Benchmark uses a generated tone unless --input-wav FILE supplies 48 kHz mono audio.\n  Optional native package install: --install-ai --ai-runtime-manifest FILE --ai-manifest-sha256 HASH\nvoice-warp --ai-rollback --ai-backend cpu    Restore the previous native runtime\nvoice-warp --ai-uninstall --ai-backend NAME   Remove a native backend and its rollback build\nvoice-warp --ai-remove-runtime BUILD_ID     Remove an inactive native runtime build\n  Benchmark options: --input-wav FILE --output-wav NEW_FILE --realtime --index FILE --block-size 8192 --pitch 0 --index-ratio 0.5 --ai-device ID\n  WAV default: process the whole file and pad the final block; explicit --blocks repeats it.\n  --realtime paces blocks for sustained testing. WAV input limit: 20 minutes/256 MiB.\n  Output WAV files are never overwritten; timing does not establish speech quality.\nvoice-warp --preview             Inspect the UI without opening audio streams\n\nLinux creates a Voice Warp source automatically. Windows/macOS require a separately installed virtual cable; select its playback endpoint with --output.",
             env!("CARGO_PKG_VERSION"),
             PRESETS.len() - 1
         );
@@ -210,10 +211,12 @@ fn run() -> Result<(), String> {
 #[derive(Debug, PartialEq)]
 enum AiAction {
     Install,
+    Export,
     Doctor,
     Devices,
     Benchmark,
     Rollback,
+    Uninstall,
     Remove,
 }
 
@@ -227,7 +230,10 @@ struct AiCommand {
     block_size: usize,
     pitch: i32,
     index_ratio: f32,
-    blocks: usize,
+    blocks: Option<usize>,
+    input_wav: Option<PathBuf>,
+    output_wav: Option<PathBuf>,
+    realtime: bool,
     remove_id: Option<String>,
     manifest: Option<PathBuf>,
     manifest_hash: Option<String>,
@@ -261,7 +267,9 @@ impl AiCommand {
             "--ai-doctor",
             "--ai-devices",
             "--ai-benchmark",
+            "--ai-export",
             "--ai-rollback",
+            "--ai-uninstall",
             "--ai-remove-runtime",
         ]
         .into_iter()
@@ -269,7 +277,7 @@ impl AiCommand {
         .collect();
         if actions.is_empty() {
             if args.iter().any(|arg| arg.starts_with("--ai-")) {
-                return Err("AI options require --install-ai, --ai-doctor, --ai-devices, --ai-benchmark, --ai-rollback, or --ai-remove-runtime.".into());
+                return Err("AI options require --install-ai, --ai-doctor, --ai-devices, --ai-benchmark, --ai-export, --ai-rollback, --ai-uninstall, or --ai-remove-runtime.".into());
             }
             return Ok(None);
         }
@@ -281,7 +289,9 @@ impl AiCommand {
             "--ai-doctor",
             "--ai-devices",
             "--ai-benchmark",
+            "--ai-export",
             "--ai-rollback",
+            "--ai-uninstall",
             "--ai-remove-runtime",
             "--ai-backend",
             "--ai-device",
@@ -293,6 +303,9 @@ impl AiCommand {
             "--pitch",
             "--index-ratio",
             "--blocks",
+            "--input-wav",
+            "--output-wav",
+            "--realtime",
             "--report",
             "--preview",
         ];
@@ -314,14 +327,28 @@ impl AiCommand {
             "--install-ai" => AiAction::Install,
             "--ai-doctor" => AiAction::Doctor,
             "--ai-devices" => AiAction::Devices,
+            "--ai-export" => AiAction::Export,
             "--ai-rollback" => AiAction::Rollback,
+            "--ai-uninstall" => AiAction::Uninstall,
             "--ai-remove-runtime" => AiAction::Remove,
             _ => AiAction::Benchmark,
         };
-        let backend = ai_option(args, "--ai-backend")?.unwrap_or_else(|| "cpu".into());
-        if !["cpu", "auto", "cuda", "rocm", "directml", "mps"].contains(&backend.as_str()) {
+        let explicit_backend = ai_option(args, "--ai-backend")?;
+        if action == AiAction::Uninstall
+            && (explicit_backend.is_none() || explicit_backend.as_deref() == Some("auto"))
+        {
             return Err(
-                "Unknown AI backend. Choose cpu, auto, cuda, rocm, directml, or mps.".into(),
+                "--ai-uninstall requires --ai-backend with an explicit native backend name.".into(),
+            );
+        }
+        let backend = explicit_backend.unwrap_or_else(|| "cpu".into());
+        if ![
+            "cpu", "auto", "cuda", "rocm", "migraphx", "directml", "mps", "coreml",
+        ]
+        .contains(&backend.as_str())
+        {
+            return Err(
+                "Unknown AI backend. Choose cpu, auto, cuda, rocm, migraphx, directml, mps, or coreml.".into(),
             );
         }
         let device = ai_option(args, "--ai-device")?.unwrap_or_else(|| "0".into());
@@ -350,15 +377,22 @@ impl AiCommand {
             return Err("--index-ratio must be between 0 and 1.".into());
         }
         let blocks = ai_option(args, "--blocks")?
-            .unwrap_or_else(|| "64".into())
-            .parse::<usize>()
-            .map_err(|_| "Invalid --blocks")?;
-        if !(1..=100_000).contains(&blocks) {
+            .map(|value| value.parse::<usize>().map_err(|_| "Invalid --blocks"))
+            .transpose()?;
+        if blocks.is_some_and(|blocks| !(1..=100_000).contains(&blocks)) {
             return Err("--blocks must be between 1 and 100000.".into());
         }
+        let input_wav = ai_option(args, "--input-wav")?.map(PathBuf::from);
+        let output_wav = ai_option(args, "--output-wav")?.map(PathBuf::from);
+        let realtime = args.iter().any(|arg| arg == "--realtime");
+        if action != AiAction::Benchmark
+            && (input_wav.is_some() || output_wav.is_some() || realtime || blocks.is_some())
+        {
+            return Err("WAV, block count, and realtime options require --ai-benchmark.".into());
+        }
         let model = ai_option(args, "--model")?.map(PathBuf::from);
-        if action == AiAction::Benchmark && model.is_none() {
-            return Err("--ai-benchmark requires --model FILE.".into());
+        if matches!(action, AiAction::Benchmark | AiAction::Export) && model.is_none() {
+            return Err("--ai-benchmark and --ai-export require --model FILE.".into());
         }
         let manifest = ai_option(args, "--ai-runtime-manifest")?.map(PathBuf::from);
         let manifest_hash = ai_option(args, "--ai-manifest-sha256")?;
@@ -380,6 +414,9 @@ impl AiCommand {
             pitch,
             index_ratio,
             blocks,
+            input_wav,
+            output_wav,
+            realtime,
             manifest,
             manifest_hash,
             remove_id: ai_option(args, "--ai-remove-runtime")?,
@@ -388,7 +425,17 @@ impl AiCommand {
     }
 
     fn run(self, stop: Arc<AtomicBool>) -> Result<(), String> {
+        if self
+            .report
+            .as_ref()
+            .is_some_and(|path| path.symlink_metadata().is_ok())
+        {
+            return Err("The report path already exists. Choose a new file; AI reports never overwrite existing files.".into());
+        }
         let result = match self.action {
+            AiAction::Export => {
+                rvc::export_model(self.model.as_deref().unwrap(), &self.backend, stop)?
+            }
             AiAction::Install => {
                 eprintln!(
                     "Installing AI runtime. Progress: {}",
@@ -409,6 +456,10 @@ impl AiCommand {
                 rvc::runtime::rollback(&self.backend)?;
                 serde_json::json!({"rolled_back":true,"backend":self.backend})
             }
+            AiAction::Uninstall => {
+                rvc::runtime::uninstall_backend(&self.backend)?;
+                serde_json::json!({"uninstalled_native_backend":self.backend})
+            }
             AiAction::Remove => {
                 let id = self
                     .remove_id
@@ -425,60 +476,33 @@ impl AiCommand {
                     report
                 }
             }
-            AiAction::Benchmark => {
-                let loading = Instant::now();
-                let mut processor = RvcProcessor::new_cancellable(
-                    RvcConfig {
-                        model: self.model.unwrap(),
-                        index: self.index,
-                        pitch: self.pitch,
-                        index_ratio: self.index_ratio,
-                        block_size: self.block_size,
-                        backend: self.backend,
-                        device: self.device,
-                    },
-                    stop.clone(),
-                )?;
-                let startup_ms = loading.elapsed().as_secs_f64() * 1000.0;
-                let mut times = Vec::with_capacity(self.blocks);
-                for block in 0..self.blocks {
-                    if stop.load(Ordering::Relaxed) {
-                        return Err("AI benchmark canceled.".into());
-                    }
-                    let input: Vec<f32> = (0..self.block_size)
-                        .map(|sample| {
-                            let phase = (block * self.block_size + sample) as f64
-                                * 180.0
-                                * std::f64::consts::TAU
-                                / 48000.0;
-                            (phase.sin() * 0.12) as f32
-                        })
-                        .collect();
-                    let started = Instant::now();
-                    processor.process(&input)?;
-                    times.push(started.elapsed().as_secs_f64() * 1000.0);
-                }
-                let info = processor.info.clone();
-                drop(processor);
-                times.sort_by(f64::total_cmp);
-                let percentile = |fraction: f64| {
-                    times[((times.len() as f64 * fraction).ceil() as usize)
-                        .saturating_sub(1)
-                        .min(times.len() - 1)]
-                };
-                serde_json::json!({
-                    "kind":"generated_tone_inference_benchmark", "microphone_opened":false,
-                    "speech_quality_verified":false, "end_to_end_latency_measured":false,
-                    "runtime":info, "startup_and_warmup_ms":startup_ms,
-                    "blocks":self.blocks, "block_samples":self.block_size,
-                    "block_duration_ms":self.block_size as f64 / 48.0,
-                    "processing_ms":{"p50":percentile(0.5),"p95":percentile(0.95),"p99":percentile(0.99),"max":times.last()},
-                })
-            }
+            AiAction::Benchmark => rvc::benchmark::run(
+                RvcConfig {
+                    model: self.model.unwrap(),
+                    index: self.index,
+                    pitch: self.pitch,
+                    index_ratio: self.index_ratio,
+                    block_size: self.block_size,
+                    backend: self.backend,
+                    device: self.device,
+                },
+                rvc::benchmark::Options {
+                    input_wav: self.input_wav,
+                    output_wav: self.output_wav,
+                    blocks: self.blocks,
+                    realtime: self.realtime,
+                },
+                stop,
+            )?,
         };
         let text = serde_json::to_string_pretty(&result).map_err(|error| error.to_string())?;
         if let Some(path) = self.report {
-            fs::write(path, text).map_err(|error| error.to_string())?;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(text.as_bytes()))
+                .map_err(|error| error.to_string())?;
         } else {
             println!("{text}");
         }
@@ -568,7 +592,7 @@ mod cli_tests {
         assert_eq!(command.action, AiAction::Benchmark);
         assert_eq!(command.device, "uuid:GPU-test");
         assert_eq!(command.pitch, -12);
-        assert_eq!(command.blocks, 20);
+        assert_eq!(command.blocks, Some(20));
         for value in ["NaN", "inf", "-0.1", "1.1"] {
             assert!(
                 AiCommand::parse(&args(&[
@@ -580,6 +604,59 @@ mod cli_tests {
                 ]))
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn wav_options_require_benchmark_and_preserve_whole_file_default() {
+        let command = AiCommand::parse(&args(&[
+            "--ai-benchmark",
+            "--model",
+            "voice.pth",
+            "--input-wav",
+            "speech.wav",
+            "--output-wav",
+            "converted.wav",
+            "--realtime",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(command.blocks, None);
+        assert_eq!(command.input_wav, Some(PathBuf::from("speech.wav")));
+        assert_eq!(command.output_wav, Some(PathBuf::from("converted.wav")));
+        assert!(command.realtime);
+        for values in [
+            vec!["--ai-doctor", "--input-wav", "speech.wav"],
+            vec!["--install-ai", "--output-wav", "output.wav"],
+            vec!["--ai-doctor", "--realtime"],
+            vec!["--ai-benchmark", "--model", "voice.pth", "--input-wav"],
+            vec!["--ai-benchmark", "--model", "voice.pth", "--blocks", "0"],
+            vec![
+                "--ai-benchmark",
+                "--model",
+                "voice.pth",
+                "--blocks",
+                "100001",
+            ],
+        ] {
+            assert!(AiCommand::parse(&args(&values)).is_err(), "{values:?}");
+        }
+    }
+
+    #[test]
+    fn native_uninstall_requires_explicit_backend_and_exclusive_action() {
+        let command = AiCommand::parse(&args(&["--ai-uninstall", "--ai-backend", "coreml"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.action, AiAction::Uninstall);
+        assert_eq!(command.backend, "coreml");
+        for values in [
+            vec!["--ai-uninstall"],
+            vec!["--ai-uninstall", "--ai-backend", "auto"],
+            vec!["--ai-uninstall", "--ai-backend", "cpu", "--install-ai"],
+            vec!["--ai-uninstall", "--ai-backend", "cpu", "--preview"],
+        ] {
+            assert!(AiCommand::parse(&args(&values)).is_err(), "{values:?}");
         }
     }
 }

@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "windows-x86_64-cpu",
+  "os": "windows",
+  "arch": "x86_64",
+  "backend": "cpu",
+  "python": "3.12",
+  "minimum_os": "10.0.18362",
+  "lock": "windows-x86_64-cpu.txt",
+  "requirements": [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "numba==0.61.2",
+    "resampy==0.4.3",
+    "onnx==1.19.1",
+    "faiss-cpu==1.12.0",
+    "soundfile==0.13.1",
+    "dataclasses-json==0.6.7",
+    "setuptools==80.9.0",
+    "pip==25.3",
+    "wheel==0.45.1",
+    "pyinstaller==6.16.0",
+    "torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.9.1%2Bcpu-cp312-cp312-win_amd64.whl#sha256=a4e06b4f441675d26b462123c8a83e77c55f1ec8ebc081203be2db1ea8054add",
+    "torchaudio @ https://download-r2.pytorch.org/whl/cpu/torchaudio-2.9.1%2Bcpu-cp312-cp312-win_amd64.whl#sha256=53dd3155b794019e8de2dc49d044f410e6bce081d23a0e6548c156f37dfc9d0d",
+    "onnxruntime==1.23.2"
+  ],
+  "qualification": "candidate; actual platform/model/hardware qualification required",
+  "sources": [
+    "https://pytorch.org/get-started/previous-versions/",
+    "https://onnxruntime.ai/docs/execution-providers/"
+  ],
+  "lock_sha256": "1e379616136c3e5b7469ecc80de0bbefb3da5f48febbfee1ca417d798bda6946"
+}

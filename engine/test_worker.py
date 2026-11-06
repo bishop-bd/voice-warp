@@ -1,5 +1,6 @@
 """Protocol/device policy tests; no ML packages, weights, or GPU required."""
 import io
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -8,9 +9,12 @@ import sys
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from voice_warp_backend import (
-    ExplicitDeviceManager, OnnxAudit, discover_devices, select_device, validate_request,
+    ExplicitDeviceManager, OnnxAudit, discover_devices, exported_bundle_paths,
+    select_device, validate_request, verify_acceleration,
+    configure_torch_policy,
 )
 from worker import receive
 
@@ -36,7 +40,7 @@ class WorkerProtocolTests(unittest.TestCase):
                                ('index_ratio', float('nan')), ('index_ratio', True),
                                ('model_path', 'relative.pth'), ('protocol', 1),
                                ('action', 'anything'), ('backend', 'imaginary'),
-                               ('device', 0)]:
+                               ('device', 0), ('measure_performance', 1)]:
                 with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                     validate_request({**config, key: value})
             (root / 'rmvpe.onnx').unlink()
@@ -45,6 +49,47 @@ class WorkerProtocolTests(unittest.TestCase):
 
     def test_probe_requires_no_model(self):
         validate_request(dict(protocol=2, action='probe', backend='cuda', device='0'))
+
+    def test_export_needs_cache_but_not_live_audio_settings(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name in ('voice.pth', 'hubert_base.pt', 'rmvpe.onnx'):
+                (root / name).touch()
+            config = dict(protocol=2, action='export', model_path=str(root / 'voice.pth'),
+                          assets_dir=str(root), cache_dir=str(root / 'cache'))
+            validate_request(config)
+            for change in ({'cache_dir': 'relative'}, {'include_hubert': 1}):
+                with self.assertRaises(ValueError):
+                    validate_request({**config, **change})
+
+    def test_bundle_resolves_null_paths_and_detects_tampering(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            files = {}
+            for name in ('voice.onnx', 'hubert.onnx', 'rmvpe.onnx'):
+                (root / name).write_bytes(name.encode())
+                files[name] = hashlib.sha256(name.encode()).hexdigest()
+            (root / 'export.json').write_text(json.dumps(dict(schema=1, cpu_validated=True, files=files)))
+            config = dict(action='init', model_path=str(root / 'voice.onnx'), hubert_path=None)
+            resolved = exported_bundle_paths(config)
+            self.assertEqual(resolved['hubert_path'], str(root / 'hubert.onnx'))
+            self.assertEqual(resolved['rmvpe_path'], str(root / 'rmvpe.onnx'))
+            self.assertIsNone(config['hubert_path'])
+            (root / 'hubert.onnx').write_bytes(b'changed')
+            with self.assertRaisesRegex(ValueError, 'checksum mismatch'):
+                exported_bundle_paths(config)
+
+    def test_bundle_rejects_manifest_paths_outside_the_bundle(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = dict(action='init', model_path=str(root / 'voice.onnx'))
+            (root / 'voice.onnx').touch()
+            for manifest in ([], dict(schema=1, cpu_validated=False),
+                             dict(schema=1, cpu_validated=True,
+                                  files={'voice.onnx': '', 'rmvpe.onnx': '', '../escape': ''})):
+                (root / 'export.json').write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    exported_bundle_paths(config)
 
     def test_worker_reports_protocol_failure_on_stdout_without_importing_ml(self):
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('worker.py'))],
@@ -61,6 +106,27 @@ class WorkerProtocolTests(unittest.TestCase):
                                 input=b'', capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b'')
+
+    def test_failed_init_exits_cleanly_while_client_keeps_stdin_open(self):
+        process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('worker.py'))],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        try:
+            # Invalid protocol fails before importing ML, but init has already
+            # started the cancellation reader, as a real initialization does.
+            process.stdin.write('{"protocol":1,"action":"init"}\n')
+            process.stdin.flush()
+            reply = json.loads(process.stdout.readline())
+            self.assertIn('repair', reply['error'])
+            self.assertEqual(process.wait(timeout=3), 1)
+            self.assertNotIn('Fatal Python error', process.stderr.read())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
 
     def test_input_eof_interrupts_blocked_initialization_without_parent_death(self):
         code = (
@@ -102,6 +168,42 @@ class WorkerProtocolTests(unittest.TestCase):
                                 capture_output=True, timeout=3)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, b'shutdown\n')
+
+    def test_completed_export_exits_while_client_keeps_stdin_open(self):
+        # Isolate the lifecycle contract from expensive export dependencies.
+        code = (
+            "import sys\n"
+            "from types import SimpleNamespace as S\n"
+            "sys.modules['numpy']=S()\n"
+            "sys.modules['torch']=S(set_num_threads=lambda _:None,set_num_interop_threads=lambda _:None)\n"
+            "sys.modules['onnxruntime']=S()\n"
+            "sys.modules['export_models']=S(export_bundle=lambda *a,**k:{'cached':True})\n"
+            "import worker\n"
+            "worker.protocol=sys.stdout\n"
+            "worker.main()\n"
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name in ('voice.pth', 'hubert_base.pt', 'rmvpe.onnx'):
+                (root / name).touch()
+            request = dict(protocol=2, action='export', model_path=str(root / 'voice.pth'),
+                           assets_dir=str(root), cache_dir=str(root / 'cache'))
+            process = subprocess.Popen([sys.executable, '-c', code], cwd=Path(__file__).parent,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            try:
+                process.stdin.write(json.dumps(request) + '\n')
+                process.stdin.flush()
+                self.assertTrue(json.loads(process.stdout.readline())['exported'])
+                self.assertEqual(process.wait(timeout=3), 0)
+                self.assertNotIn('Fatal Python error', process.stderr.read())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
 
 
 class DeviceTests(unittest.TestCase):
@@ -152,6 +254,46 @@ class DeviceTests(unittest.TestCase):
         self.assertEqual(manager.getDevice(-1), ('cpu',))
         self.assertFalse(manager.halfPrecisionAvailable(-1))
 
+    def test_migraphx_pitch_policy_does_not_change_other_stage_providers(self):
+        torch = SimpleNamespace(device=lambda *args: args)
+        ort = SimpleNamespace(get_available_providers=lambda: ['MIGraphXExecutionProvider', 'CPUExecutionProvider'])
+        manager = ExplicitDeviceManager(torch, ort, dict(backend='migraphx', index=0))
+        with manager.onnx_stage('pitch'):
+            self.assertEqual(manager.getOnnxExecutionProvider(0)[0], ['CPUExecutionProvider'])
+            self.assertEqual(manager.device, ('cuda', 0))
+        self.assertEqual(manager.getOnnxExecutionProvider(0)[0], ['MIGraphXExecutionProvider'])
+        with self.assertRaises(ValueError):
+            with manager.onnx_stage('pitch'):
+                raise ValueError('construction failed')
+        self.assertEqual(manager.getOnnxExecutionProvider(0)[0], ['MIGraphXExecutionProvider'])
+
+    def test_acceleration_requires_a_model_stage_not_just_a_gpu_tensor(self):
+        stages = {'hubert': 'CPU', 'synthesizer': 'CPU'}
+        for backend in ('cuda', 'rocm', 'mps', 'directml', 'migraphx'):
+            with self.subTest(backend=backend), self.assertRaisesRegex(RuntimeError, 'no HuBERT'):
+                verify_acceleration(backend, stages)
+        self.assertTrue(verify_acceleration('rocm', {**stages, 'hubert': 'cuda:0'}))
+        self.assertTrue(verify_acceleration('directml', {**stages, 'synthesizer': 'DmlExecutionProvider + CPU nodes'}))
+        self.assertFalse(verify_acceleration('cpu', stages))
+        self.assertFalse(verify_acceleration('coreml', {'hubert': 'CoreMLExecutionProvider'}))
+
+    def test_native_gpu_convolution_policy_requires_exact_qualified_target(self):
+        for backend, os_name, version, architecture, applies in (
+            ('rocm', 'Linux', '2.9.1+rocm7.2.1.gitff65f5bc', 'gfx1150:xnack-', True),
+            ('rocm', 'Linux', '2.9.1+rocm7.2.1.gitff65f5bc', 'gfx1151', False),
+            ('rocm', 'Linux', '2.9.1+rocm7.2.1.gitff65f5bc', '', False),
+            ('rocm', 'Linux', '2.9.1+rocm7.2.2.gitabc', 'gfx1150', False),
+            ('rocm', 'Windows', '2.9.1+rocm7.2.1.gitff65f5bc', 'gfx1150', False),
+            ('cuda', 'Linux', '2.9.1+rocm7.2.1.gitff65f5bc', 'gfx1150', False),
+        ):
+            torch = SimpleNamespace(__version__=version,
+                backends=SimpleNamespace(cudnn=SimpleNamespace(enabled=True)),
+                cuda=SimpleNamespace(get_device_properties=lambda _: SimpleNamespace(gcnArchName=architecture)))
+            with self.subTest(backend=backend, os=os_name, version=version, architecture=architecture), patch('voice_warp_backend.platform.system', return_value=os_name):
+                policy = configure_torch_policy(torch, dict(backend=backend, index=0))
+                self.assertEqual(torch.backends.cudnn.enabled, not applies)
+                self.assertEqual(policy['convolution'], 'ATen GPU' if applies else 'framework default')
+
 
 class AuditTests(unittest.TestCase):
     def fake_ort(self, executed=None, initialized=None):
@@ -176,7 +318,8 @@ class AuditTests(unittest.TestCase):
                 return path
 
         return SimpleNamespace(InferenceSession=Session, SessionOptions=SimpleNamespace,
-                               ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0)), created
+                               ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL=0),
+                               GraphOptimizationLevel=SimpleNamespace(ORT_DISABLE_ALL=0)), created
 
     def test_directml_options_fallback_and_actual_kernel_placement(self):
         ort, created = self.fake_ort(['DmlExecutionProvider', 'CPUExecutionProvider'])
@@ -213,6 +356,27 @@ class AuditTests(unittest.TestCase):
                 with audit.session_factory():
                     ort.InferenceSession('model.onnx', providers=['DmlExecutionProvider'])
             self.assertIs(ort.InferenceSession, original)
+        finally:
+            audit.close()
+
+    def test_coreml_provider_does_not_claim_physical_gpu_measurement(self):
+        ort, _ = self.fake_ort(['CoreMLExecutionProvider'])
+        audit = OnnxAudit(ort)
+        try:
+            with audit.session_factory():
+                session = ort.InferenceSession('model.onnx', providers=['CoreMLExecutionProvider'])
+            self.assertIn('physical GPU use not measured', audit.placement(session))
+        finally:
+            audit.close()
+
+    def test_migraphx_avoids_ort_empty_shape_constant_folding(self):
+        ort, created = self.fake_ort(['MIGraphXExecutionProvider'])
+        audit = OnnxAudit(ort)
+        try:
+            with audit.session_factory():
+                session = ort.InferenceSession('model.onnx', providers=['MIGraphXExecutionProvider'])
+            self.assertEqual(created[0].options.graph_optimization_level, ort.GraphOptimizationLevel.ORT_DISABLE_ALL)
+            self.assertEqual(audit.placement(session), 'MIGraphXExecutionProvider')
         finally:
             audit.close()
 

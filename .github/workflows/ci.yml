@@ -33,6 +33,7 @@ jobs:
         run: |
           python engine/test_worker.py
           python scripts/test_ai_runtime_package.py
+          python scripts/test_ai_release.py
       - name: Install Linux build and audio dependencies
         if: runner.os == 'Linux'
         run: |

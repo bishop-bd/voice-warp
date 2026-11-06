@@ -16,6 +16,9 @@ use std::{
 const MAX_MANIFEST: u64 = 4 * 1024 * 1024;
 const MAX_ARCHIVE: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 32 * 1024 * 1024 * 1024;
+const BACKENDS: &[&str] = &[
+    "cpu", "cuda", "rocm", "migraphx", "mps", "coreml", "directml",
+];
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -29,6 +32,12 @@ pub struct Manifest {
     pub arch: String,
     pub backend: String,
     pub minimum_os: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profile_lock_sha256: Option<String>,
+    #[serde(default)]
+    pub minimum_driver: Option<String>,
     pub executable: String,
     pub assets_dir: String,
     pub archive: String,
@@ -52,8 +61,32 @@ struct Release {
     os: String,
     arch: String,
     backend: String,
-    manifest_url: String,
+    #[serde(default)]
+    manifest_url: Option<String>,
+    #[serde(default)]
+    manifest_file: Option<String>,
     manifest_sha256: String,
+    #[serde(default)]
+    archive_size: Option<u64>,
+}
+
+/// Display only metadata authenticated by the desktop build's embedded catalog.
+pub fn package_size(backend: &str) -> Option<u64> {
+    let backend = normalized_backend(backend).ok()?;
+    let catalog: Catalog =
+        serde_json::from_str(include_str!("../../engine/runtime-catalog.json")).ok()?;
+    if catalog.schema != 1 {
+        return None;
+    }
+    catalog
+        .releases
+        .iter()
+        .find(|entry| {
+            entry.os == std::env::consts::OS
+                && entry.arch == std::env::consts::ARCH
+                && entry.backend == backend
+        })
+        .and_then(|entry| entry.archive_size)
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -118,7 +151,7 @@ fn valid_id(value: &str) -> bool {
 fn normalized_backend(backend: &str) -> Result<&str, String> {
     match backend {
         "auto" => Ok("cpu"),
-        "cpu" | "cuda" | "rocm" | "mps" | "directml" => Ok(backend),
+        backend if BACKENDS.contains(&backend) => Ok(backend),
         _ => Err("Unknown AI runtime backend.".into()),
     }
 }
@@ -200,6 +233,20 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    match (&manifest.profile, &manifest.profile_lock_sha256) {
+        (None, None) => {}
+        (Some(profile), Some(digest))
+            if profile == &format!("{}-{}-{}", manifest.os, manifest.arch, manifest.backend)
+                && is_digest(digest) => {}
+        _ => return Err("Runtime dependency profile or lock checksum is invalid.".into()),
+    }
+    if manifest
+        .minimum_driver
+        .as_ref()
+        .is_some_and(|value| value.len() > 4096 || value.contains('\0'))
+    {
+        return Err("Invalid runtime driver requirement.".into());
+    }
     if manifest.schema != 1 || manifest.protocol != 2 {
         return Err("Incompatible AI runtime package protocol. Update the application and package together.".into());
     }
@@ -219,9 +266,9 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
             manifest.backend.as_str()
         ),
         ("windows", "x86_64", "cpu" | "cuda" | "rocm" | "directml")
-            | ("macos", "aarch64", "cpu" | "mps")
-            | ("macos", "x86_64", "cpu")
-            | ("linux", "x86_64", "cpu" | "cuda" | "rocm")
+            | ("macos", "aarch64", "cpu" | "mps" | "coreml")
+            | ("macos", "x86_64", "cpu" | "coreml")
+            | ("linux", "x86_64", "cpu" | "cuda" | "rocm" | "migraphx")
     );
     if !backend_valid {
         return Err(
@@ -391,6 +438,10 @@ fn write_active(root: &Path, backend: &str, active: &Active) -> Result<(), Strin
 
 pub fn locate(backend: &str) -> Result<InstalledRuntime, String> {
     locate_at(&data_dir(), normalized_backend(backend)?)
+}
+
+pub fn is_installed(backend: &str) -> bool {
+    normalized_backend(backend).is_ok() && active_path(&data_dir(), backend).is_file()
 }
 
 fn locate_at(root: &Path, backend: &str) -> Result<InstalledRuntime, String> {
@@ -776,11 +827,28 @@ pub fn install_bundled(backend: &str, stop: &AtomicBool) -> Result<(), String> {
     }
     let release = catalog.releases.iter().find(|entry| entry.os == std::env::consts::OS && entry.arch == std::env::consts::ARCH && entry.backend == backend)
         .ok_or_else(|| format!("No published {backend} native runtime is included in this app's trusted catalog for {} {}. Build a runtime with scripts/build-ai-runtime.py and import its manifest with --ai-runtime-manifest and --ai-manifest-sha256, or use a release with a qualified runtime catalog.", std::env::consts::OS, std::env::consts::ARCH))?;
+    let bundled_root = packaged_runtime_root()?;
+    if let Some(path) = local_release_manifest(release, &bundled_root)? {
+        let bytes = read_bounded(&path)?;
+        if digest_bytes(&bytes) != release.manifest_sha256.to_ascii_lowercase() {
+            return Err("Bundled runtime manifest checksum failed.".into());
+        }
+        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        validate_manifest(&manifest)?;
+        if manifest.backend != backend {
+            return Err("Bundled runtime backend mismatch.".into());
+        }
+        return install_package(&path, &release.manifest_sha256, stop);
+    }
+    let manifest_url = release
+        .manifest_url
+        .as_deref()
+        .ok_or("Missing runtime manifest URL")?;
     let root = data_dir();
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let temporary = staging(&root)?;
     let manifest_path = temporary.0.join("manifest.json");
-    download(&release.manifest_url, &manifest_path, MAX_MANIFEST, stop)?;
+    download(manifest_url, &manifest_path, MAX_MANIFEST, stop)?;
     let bytes = read_bounded(&manifest_path)?;
     if digest_bytes(&bytes) != release.manifest_sha256.to_ascii_lowercase() {
         return Err("Published runtime manifest checksum failed.".into());
@@ -790,7 +858,7 @@ pub fn install_bundled(backend: &str, stop: &AtomicBool) -> Result<(), String> {
     if manifest.backend != backend {
         return Err("Published runtime backend mismatch.".into());
     }
-    let base = reqwest::Url::parse(&release.manifest_url).map_err(|e| e.to_string())?;
+    let base = reqwest::Url::parse(manifest_url).map_err(|e| e.to_string())?;
     let archive_url = base.join(&manifest.archive).map_err(|e| e.to_string())?;
     download(
         archive_url.as_str(),
@@ -799,6 +867,44 @@ pub fn install_bundled(backend: &str, stop: &AtomicBool) -> Result<(), String> {
         stop,
     )?;
     install_package(&manifest_path, &release.manifest_sha256, stop)
+}
+
+fn packaged_runtime_root() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+    let parent = executable
+        .parent()
+        .ok_or("Cannot locate desktop package directory")?;
+    #[cfg(target_os = "macos")]
+    if parent.file_name().is_some_and(|name| name == "MacOS")
+        && parent
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "Contents")
+    {
+        return Ok(parent.parent().unwrap().join("Resources"));
+    }
+    Ok(parent.to_path_buf())
+}
+
+fn local_release_manifest(release: &Release, root: &Path) -> Result<Option<PathBuf>, String> {
+    if !is_digest(&release.manifest_sha256) {
+        return Err("Invalid trusted runtime manifest checksum.".into());
+    }
+    match (&release.manifest_file, &release.manifest_url) {
+        (Some(relative), None) if safe_relative(relative) => {
+            let canonical_root = fs::canonicalize(root).map_err(|e| e.to_string())?;
+            let candidate = fs::canonicalize(root.join(relative))
+                .map_err(|e| format!("Bundled AI runtime package is missing: {e}"))?;
+            if !candidate.starts_with(&canonical_root) {
+                return Err("Bundled AI runtime path leaves its desktop package.".into());
+            }
+            Ok(Some(candidate))
+        }
+        (None, Some(url)) if url.starts_with("https://") => Ok(None),
+        _ => Err(
+            "Trusted runtime entry must specify exactly one safe local path or HTTPS URL.".into(),
+        ),
+    }
 }
 
 pub fn rollback(backend: &str) -> Result<(), String> {
@@ -827,15 +933,153 @@ pub fn rollback(backend: &str) -> Result<(), String> {
     )
 }
 
+/// Uninstall a native backend's selected and rollback builds. This does not
+/// touch model libraries, settings, container images, or another backend.
+pub fn uninstall_backend(backend: &str) -> Result<(), String> {
+    uninstall_at(&data_dir(), backend, remove_runtime_directory)
+}
+
+fn uninstall_at(
+    root: &Path,
+    backend: &str,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    if backend == "auto" {
+        return Err("Uninstall requires an explicit native backend name, not auto.".into());
+    }
+    let backend = normalized_backend(backend)?;
+    let _lock = global_lock(root, true)?;
+    let active = read_active(root, backend)
+        .map_err(|e| format!("Cannot uninstall the {backend} native runtime: {e}"))?;
+    let mut ids = vec![active.current];
+    if let Some(previous) = active.previous
+        && !ids.contains(&previous)
+    {
+        ids.push(previous);
+    }
+    if ids.iter().any(|id| !valid_id(id)) {
+        return Err("Invalid installed runtime ID. No runtime was uninstalled.".into());
+    }
+    // Even a malformed cross-backend selection must not authorize deleting
+    // another backend's retained runtime.
+    for other in BACKENDS.iter().copied().filter(|other| *other != backend) {
+        if active_path(root, other)
+            .try_exists()
+            .map_err(|e| e.to_string())?
+        {
+            let selected = read_active(root, other)?;
+            if ids
+                .iter()
+                .any(|id| selected.current == *id || selected.previous.as_ref() == Some(id))
+            {
+                return Err(format!(
+                    "A selected build is also retained by {other}. Repair that selection before uninstalling."
+                ));
+            }
+        }
+    }
+    let mut leases = Vec::new();
+    let mut directories = Vec::new();
+    for id in &ids {
+        let directory = root.join(id);
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Runtime {id} is not a managed directory. No runtime was uninstalled."
+            ));
+        }
+        let manifest: Manifest =
+            serde_json::from_slice(&read_bounded(&directory.join("runtime.json"))?)
+                .map_err(|e| format!("Cannot verify runtime {id} ownership: {e}"))?;
+        if manifest.id != *id || manifest.backend != backend {
+            return Err(format!(
+                "Runtime {id} belongs to a different selection. No runtime was uninstalled."
+            ));
+        }
+        let lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join(".lease"))
+            .map_err(|e| format!("Cannot acquire runtime {id}: {e}"))?;
+        leases.push(LockGuard::exclusive(lease).map_err(|_| {
+            format!("Runtime {id} is still in use. Stop its AI session before uninstalling.")
+        })?);
+        directories.push((id.clone(), directory));
+    }
+    // Nothing changes until every existing selected/rollback build is idle.
+    // Deactivate before deleting so a partial failure leaves only inactive
+    // builds, which --ai-remove-runtime can remove after the cause is repaired.
+    fs::remove_file(active_path(root, backend)).map_err(|e| e.to_string())?;
+    drop(leases); // Windows cannot remove an open lease; global lock stays held.
+    let mut failed = Vec::new();
+    for (id, directory) in directories {
+        if let Err(error) = remove(&directory) {
+            failed.push(format!(
+                "{id}: {error}; retry with --ai-remove-runtime {id}"
+            ));
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The {backend} native runtime was deactivated, but some inactive files could not be removed:\n{}",
+            failed.join("\n")
+        ))
+    }
+}
+
+fn remove_runtime_directory(directory: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Runtime removal requires a managed directory, not a link or file",
+        ));
+    }
+    // Keep the lease until all other entries are gone, allowing safe retries
+    // after a permission/antivirus/file-in-use error partway through removal.
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name() == ".lease" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    fs::remove_file(directory.join(".lease"))?;
+    if let Err(error) = fs::remove_dir(directory) {
+        // A concurrent external writer may have added a file. Maintenance's
+        // global lock still excludes sessions, so restoring the lease is safe.
+        let _ = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(".lease"));
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Remove an inactive build only. Active selection and user model files are preserved.
 pub fn remove_build(id: &str) -> Result<(), String> {
+    remove_build_at(&data_dir(), id)
+}
+
+fn remove_build_at(root: &Path, id: &str) -> Result<(), String> {
     if !valid_id(id) {
         return Err("Invalid runtime build ID.".into());
     }
-    let root = data_dir();
-    let _lock = global_lock(&root, true)?;
-    for backend in ["cpu", "cuda", "rocm", "mps", "directml"] {
-        if let Ok(active) = read_active(&root, backend)
+    let _lock = global_lock(root, true)?;
+    for backend in BACKENDS {
+        if let Ok(active) = read_active(root, backend)
             && (active.current == id || active.previous.as_deref() == Some(id))
         {
             return Err("This runtime is active or retained for rollback. Select another build before removing it.".into());
@@ -852,12 +1096,63 @@ pub fn remove_build(id: &str) -> Result<(), String> {
     // On Windows the open lease must be closed before deleting its directory. The
     // global exclusive lock prevents a new locate() between close and removal.
     drop(lease);
-    fs::remove_dir_all(dir).map_err(|e| e.to_string())
+    remove_runtime_directory(&dir).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modern_package_profile_metadata_is_accepted_and_validated() {
+        let temp = scratch();
+        let (path, _) = fixture(&temp.0.join("package"), None);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        value["profile"] = serde_json::json!(format!(
+            "{}-{}-cpu",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+        value["profile_lock_sha256"] = serde_json::json!("a".repeat(64));
+        value["minimum_driver"] = serde_json::Value::Null;
+        let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+        validate_manifest(&manifest).unwrap();
+        value["profile"] = serde_json::json!("wrong-platform-cpu");
+        assert!(validate_manifest(&serde_json::from_value(value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn every_backend_protects_active_and_rollback_builds_from_removal() {
+        let temp = scratch();
+        for backend in BACKENDS {
+            let current = format!("{backend}-current");
+            let previous = format!("{backend}-previous");
+            write_active(
+                &temp.0,
+                backend,
+                &Active {
+                    current: current.clone(),
+                    previous: Some(previous.clone()),
+                },
+            )
+            .unwrap();
+            for id in [&current, &previous] {
+                fs::create_dir(temp.0.join(id)).unwrap();
+                File::create(temp.0.join(id).join(".lease")).unwrap();
+                assert!(
+                    remove_build_at(&temp.0, id)
+                        .unwrap_err()
+                        .contains("active or retained")
+                );
+                assert!(temp.0.join(id).is_dir());
+            }
+        }
+        fs::create_dir(temp.0.join("inactive")).unwrap();
+        File::create(temp.0.join("inactive/.lease")).unwrap();
+        remove_build_at(&temp.0, "inactive").unwrap();
+        assert!(!temp.0.join("inactive").exists());
+    }
 
     #[test]
     fn archive_paths_are_portable_and_cannot_escape() {
@@ -906,6 +1201,9 @@ mod tests {
             arch: std::env::consts::ARCH.into(),
             backend: "cpu".into(),
             minimum_os: "0".into(),
+            profile: None,
+            profile_lock_sha256: None,
+            minimum_driver: None,
             executable: "worker".into(),
             assets_dir: "assets".into(),
             archive: "runtime.zip".into(),
@@ -929,6 +1227,185 @@ mod tests {
 
     fn scratch() -> Staging {
         staging(&std::env::temp_dir()).unwrap()
+    }
+
+    fn installed_fixture(root: &Path, backend: &str, id: &str) {
+        let (source, _) = fixture(&root.join(format!("package-{id}")), None);
+        let mut manifest: Manifest = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        manifest.id = id.into();
+        manifest.backend = backend.into();
+        let directory = root.join(id);
+        fs::create_dir_all(directory.join("assets/nested")).unwrap();
+        fs::write(
+            directory.join("runtime.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(directory.join("assets/nested/weights"), b"fixture weights").unwrap();
+        File::create(directory.join(".lease")).unwrap();
+    }
+
+    #[test]
+    fn uninstall_requires_all_leases_before_changing_any_selection_or_files() {
+        let temp = scratch();
+        for id in ["cpu-current", "cpu-previous"] {
+            installed_fixture(&temp.0, "cpu", id);
+        }
+        write_active(
+            &temp.0,
+            "cpu",
+            &Active {
+                current: "cpu-current".into(),
+                previous: Some("cpu-previous".into()),
+            },
+        )
+        .unwrap();
+        for busy in ["cpu-current", "cpu-previous"] {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(temp.0.join(busy).join(".lease"))
+                .unwrap();
+            let held = LockGuard::shared(file).unwrap();
+            let error = uninstall_at(&temp.0, "cpu", remove_runtime_directory).unwrap_err();
+            assert!(error.contains("still in use"));
+            assert_eq!(read_active(&temp.0, "cpu").unwrap().current, "cpu-current");
+            for id in ["cpu-current", "cpu-previous"] {
+                assert!(temp.0.join(id).join("assets/nested/weights").is_file());
+            }
+            drop(held);
+        }
+        uninstall_at(&temp.0, "cpu", remove_runtime_directory).unwrap();
+        assert!(!active_path(&temp.0, "cpu").exists());
+        assert!(!temp.0.join("cpu-current").exists());
+        assert!(!temp.0.join("cpu-previous").exists());
+    }
+
+    #[test]
+    fn uninstall_preserves_other_backends_models_settings_and_inactive_builds() {
+        let temp = scratch();
+        for (backend, id) in [
+            ("cpu", "cpu-current"),
+            ("coreml", "coreml-current"),
+            ("coreml", "coreml-previous"),
+            ("cpu", "cpu-inactive"),
+        ] {
+            installed_fixture(&temp.0, backend, id);
+        }
+        write_active(
+            &temp.0,
+            "cpu",
+            &Active {
+                current: "cpu-current".into(),
+                previous: None,
+            },
+        )
+        .unwrap();
+        write_active(
+            &temp.0,
+            "coreml",
+            &Active {
+                current: "coreml-current".into(),
+                previous: Some("coreml-previous".into()),
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(temp.0.join("user-models/nested")).unwrap();
+        fs::write(temp.0.join("user-models/nested/voice.pth"), b"user model").unwrap();
+        fs::write(temp.0.join("settings.json"), b"user settings").unwrap();
+        uninstall_at(&temp.0, "cpu", remove_runtime_directory).unwrap();
+        assert!(!temp.0.join("cpu-current").exists());
+        for id in ["coreml-current", "coreml-previous", "cpu-inactive"] {
+            assert!(temp.0.join(id).join("assets/nested/weights").is_file());
+        }
+        assert_eq!(
+            read_active(&temp.0, "coreml").unwrap().current,
+            "coreml-current"
+        );
+        assert_eq!(
+            fs::read(temp.0.join("user-models/nested/voice.pth")).unwrap(),
+            b"user model"
+        );
+        assert_eq!(
+            fs::read(temp.0.join("settings.json")).unwrap(),
+            b"user settings"
+        );
+    }
+
+    #[test]
+    fn partial_uninstall_deactivates_and_keeps_failed_build_removable() {
+        let temp = scratch();
+        for id in ["cpu-current", "cpu-previous"] {
+            installed_fixture(&temp.0, "cpu", id);
+        }
+        write_active(
+            &temp.0,
+            "cpu",
+            &Active {
+                current: "cpu-current".into(),
+                previous: Some("cpu-previous".into()),
+            },
+        )
+        .unwrap();
+        let error = uninstall_at(&temp.0, "cpu", |directory| {
+            if directory.ends_with("cpu-previous") {
+                // Model a permission/antivirus failure after partial deletion.
+                fs::remove_file(directory.join("runtime.json"))?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture file in use",
+                ))
+            } else {
+                remove_runtime_directory(directory)
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("--ai-remove-runtime cpu-previous"));
+        assert!(!active_path(&temp.0, "cpu").exists());
+        assert!(!temp.0.join("cpu-current").exists());
+        assert!(temp.0.join("cpu-previous/.lease").is_file());
+        remove_build_at(&temp.0, "cpu-previous").unwrap();
+        assert!(!temp.0.join("cpu-previous").exists());
+    }
+
+    #[test]
+    fn uninstall_rejects_auto_and_cross_backend_references_without_mutation() {
+        let temp = scratch();
+        installed_fixture(&temp.0, "cpu", "shared-build");
+        for backend in ["cpu", "coreml"] {
+            write_active(
+                &temp.0,
+                backend,
+                &Active {
+                    current: "shared-build".into(),
+                    previous: None,
+                },
+            )
+            .unwrap();
+        }
+        assert!(uninstall_at(&temp.0, "auto", remove_runtime_directory).is_err());
+        assert!(
+            uninstall_at(&temp.0, "cpu", remove_runtime_directory)
+                .unwrap_err()
+                .contains("also retained by coreml")
+        );
+        assert!(temp.0.join("shared-build/assets/nested/weights").is_file());
+        assert!(active_path(&temp.0, "cpu").is_file());
+        assert!(active_path(&temp.0, "coreml").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inactive_removal_never_follows_a_directory_link_into_user_files() {
+        let temp = scratch();
+        let models = temp.0.join("models");
+        fs::create_dir(&models).unwrap();
+        fs::write(models.join("voice.pth"), b"user voice").unwrap();
+        File::create(models.join(".lease")).unwrap();
+        std::os::unix::fs::symlink(&models, temp.0.join("linked-build")).unwrap();
+        assert!(remove_build_at(&temp.0, "linked-build").is_err());
+        assert_eq!(fs::read(models.join("voice.pth")).unwrap(), b"user voice");
+        assert!(models.join(".lease").is_file());
     }
 
     #[test]
@@ -1075,5 +1552,33 @@ mod tests {
             .contains("canceled")
         );
         assert!(!temp.0.join("never").exists());
+    }
+
+    #[test]
+    fn offline_catalog_resolves_only_packaged_manifests() {
+        let temp = scratch();
+        fs::create_dir(temp.0.join("ai-runtimes")).unwrap();
+        fs::write(temp.0.join("ai-runtimes/cpu.json"), b"{}").unwrap();
+        let mut release = Release {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            backend: "cpu".into(),
+            manifest_url: None,
+            manifest_file: Some("ai-runtimes/cpu.json".into()),
+            manifest_sha256: digest_bytes(b"{}"),
+            archive_size: None,
+        };
+        assert_eq!(
+            local_release_manifest(&release, &temp.0).unwrap().unwrap(),
+            fs::canonicalize(temp.0.join("ai-runtimes/cpu.json")).unwrap()
+        );
+        release.manifest_url = Some("https://example.com/runtime.json".into());
+        assert!(local_release_manifest(&release, &temp.0).is_err());
+        release.manifest_url = None;
+        release.manifest_file = Some("../outside.json".into());
+        assert!(local_release_manifest(&release, &temp.0).is_err());
+        release.manifest_file = None;
+        release.manifest_url = Some("http://example.com/runtime.json".into());
+        assert!(local_release_manifest(&release, &temp.0).is_err());
     }
 }

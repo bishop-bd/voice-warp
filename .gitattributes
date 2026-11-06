@@ -8,3 +8,8 @@
 *.desktop text eol=lf
 *.svg text eol=lf
 *.png binary
+# Runtime profiles authenticate the exact checked-in lock bytes on every OS.
+engine/locks/*.txt text eol=lf
+engine/profiles/*.json text eol=lf
+engine/runtime-catalog.json text eol=lf
+*.py text eol=lf

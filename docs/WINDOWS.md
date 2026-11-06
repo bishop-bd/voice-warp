@@ -30,13 +30,13 @@ For monitoring, select a separate physical headphone output in Voice Warp. Monit
 
 The voice presets and soundboard work with the native backend. Import your own WAV clips through **Soundboard → Import WAV** while stopped. Keys **1–9** play sounds and **Esc** stops them while the app window is focused. **Mute voice** leaves the soundboard audible; **Mute all** silences both.
 
-AI is optional. The app can now own a native Windows x64 worker, with CPU, NVIDIA CUDA, and partial ONNX/DirectML execution paths. The runtime package contains its interpreter/libraries, so inference does not require a separate w-okada server, Python installation, WSL, or Docker. **The trusted native download catalog is currently empty:** build and install an explicitly trusted candidate package using [native runtime packaging](AI-RUNTIME-PACKAGES.md), or keep the existing external w-okada v1 setup. Candidate builds and GPU paths still require clean-machine and hardware qualification; native Windows ROCm packaging remains pending.
+AI is optional. The app can now own a native Windows x64 worker, with CPU, NVIDIA CUDA, native AMD ROCm, and ONNX/DirectML execution paths. The runtime package contains its interpreter/libraries, so inference does not require a separate w-okada server, Python installation, WSL, or Docker. **The source catalog has no published native downloads yet.** The native workflow can build an offline desktop ZIP containing authenticated runtime packages; its install button then works without separate downloads. Source-only builds can import a trusted candidate using [native runtime packaging](AI-RUNTIME-PACKAGES.md). The existing external w-okada v1 setup remains optional. Candidate builds and GPU paths still require clean-machine and hardware qualification; the native Windows ROCm profile uses AMD's Python 3.12/PyTorch 2.9.1 packages for supported hardware.
 
-Follow [the AI setup guide](AI.md) for backend/device selection, model testing, diagnostics, and limitations. DirectML requires an ONNX voice and retains CPU stages. The audio route remains the same: converted audio goes to the selected cable output. Voice models and native runtime payloads are separate from the desktop ZIP.
+Follow [the AI setup guide](AI.md) for backend/device selection, model testing, diagnostics, and limitations. DirectML requires an ONNX voice; use **Export ONNX voice** to create a complete neural-stage bundle. Index retrieval and audio processing still run on CPU. The audio route remains the same: converted audio goes to the selected cable output. Voice models remain separate. An offline desktop ZIP includes runtime payloads; a source-only desktop build needs a separately imported runtime.
 
 ## Build a Windows package
 
-On Windows, install Rust's `x86_64-pc-windows-msvc` toolchain and Microsoft C++ Build Tools with the Windows SDK. From a source checkout, run in PowerShell:
+On Windows, install Rust's `x86_64-pc-windows-msvc` toolchain, Microsoft C++ Build Tools with the Windows SDK, and Python 3.10 or newer with `python.exe` on `PATH`. Python verifies the runtime catalog and creates ZIP64 archives on the build machine; users of the finished package do not need it. Building AI runtime packages additionally requires Python 3.12. From a source checkout, run in PowerShell:
 
 ```powershell
 .\scripts\package-windows.ps1

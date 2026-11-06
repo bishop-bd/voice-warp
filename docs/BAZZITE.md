@@ -20,7 +20,7 @@ The package is for x86-64 Bazzite desktops and handhelds, including Steam Deck. 
 
 Use headphones if you enable monitoring. In **Soundboard**, **Import WAVs** accepts multiple files; **Remove** works on built-in sounds too. There is no library-count limit. Each WAV can be up to 60 seconds and 128 MiB, and eight sounds can play at once.
 
-Optional local AI can use Voice Warp's managed Podman worker without a separately installed RVC server. Install the selected runtime in **Local AI** and supply a trusted voice model. CPU, CUDA, and ROCm recipes have different hardware requirements and validation limits; see [AI setup](AI.md). The normal voice effects and soundboard are included and need no AI runtime.
+Optional local AI can use Voice Warp's managed Podman worker without a separately installed RVC server. Install the selected runtime in **Local AI** and supply a trusted voice model. CPU, CUDA, ROCm, and MIGraphX recipes have different hardware requirements and validation limits; see [AI setup](AI.md). The normal voice effects and soundboard are included and need no AI runtime.
 
 ## Update or remove
 
