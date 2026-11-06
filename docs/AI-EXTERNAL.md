@@ -1,6 +1,8 @@
-# Local AI voice conversion
+# Optional external AI server
 
-Voice Warp's optional AI mode sends microphone blocks to a **local w-okada v1 RVC server**, then routes the converted audio into the same virtual microphone used by its regular effects and soundboard. Voice Warp itself is Rust. The separately installed inference server uses Python and model weights; neither is bundled or automatically downloaded by Voice Warp.
+This guide applies only to **Local AI → External server**. That mode sends microphone blocks to a separately managed **local w-okada v1 RVC server**, then routes converted audio through Voice Warp's ordinary output. The external server and its model installation remain under your control.
+
+The separate [bundled engine](AI.md) owns its own worker, installation, and lifetime. It does not require this server. Native bundled runtime distribution currently has additional qualification and package-availability limits; see [native runtime packages](AI-RUNTIME-PACKAGES.md).
 
 The adapter targets the v1 REST protocol at upstream commit [`d8ef15799470193f7c8176ef471245753a656626`](https://github.com/w-okada/voice-changer/tree/d8ef15799470193f7c8176ef471245753a656626). It is **not** an integration with the separate VC Client v2 protocol. RVC is the supported model family; other families are rejected until their streaming behavior is verified.
 

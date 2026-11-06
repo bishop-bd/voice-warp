@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "linux-x86_64-cuda",
+  "os": "linux",
+  "arch": "x86_64",
+  "backend": "cuda",
+  "python": "3.12",
+  "minimum_os": "Ubuntu 24.04 container",
+  "lock": "linux-x86_64-cuda.txt",
+  "requirements": [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "numba==0.61.2",
+    "resampy==0.4.3",
+    "onnx==1.19.1",
+    "faiss-cpu==1.12.0",
+    "soundfile==0.13.1",
+    "dataclasses-json==0.6.7",
+    "setuptools==80.9.0",
+    "pip==25.3",
+    "wheel==0.45.1",
+    "pyinstaller==6.16.0",
+    "torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=7cb4018f4ce68b61fd3ef87dc1c4ca520731c7b5b200e360ad47b612d7844063",
+    "torchaudio @ https://download-r2.pytorch.org/whl/cu128/torchaudio-2.9.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=54eb19e634b8c567886a1b53b4184506d943c3ba5139198e9fe1b941bc566f30",
+    "onnxruntime-gpu==1.23.2"
+  ],
+  "qualification": "candidate; actual platform/model/hardware qualification required",
+  "sources": [
+    "https://pytorch.org/get-started/previous-versions/",
+    "https://onnxruntime.ai/docs/execution-providers/"
+  ],
+  "lock_sha256": "8c52093ea3c781425a9e9b9224dd4d91efa200eb771bdc1bf892fc7e7e82fc6b"
+}

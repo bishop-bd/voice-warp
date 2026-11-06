@@ -1,4 +1,7 @@
 /target/
 /dist/
 *.log
+/plan.md
+__pycache__/
+*.py[cod]
 

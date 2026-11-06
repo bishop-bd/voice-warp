@@ -523,6 +523,9 @@ impl MixProcessor {
 
 impl Processor for MixProcessor {
     fn set_stop_signal(&mut self, stop: Arc<AtomicBool>) {
+        if let Some(ai) = &mut self.ai {
+            ai.set_stop_signal(stop.clone());
+        }
         self.stop_signal = Some(stop);
     }
 
@@ -910,6 +913,59 @@ mod tests {
                 .iter()
                 .all(|x| *x == 0.0)
         );
+    }
+
+    #[test]
+    fn stop_interrupts_inflight_inference_through_the_mixer() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        struct WaitingAi {
+            stop: Option<Arc<AtomicBool>>,
+            entered: mpsc::Sender<()>,
+        }
+        impl Processor for WaitingAi {
+            fn set_stop_signal(&mut self, stop: Arc<AtomicBool>) {
+                self.stop = Some(stop);
+            }
+            fn process(&mut self, _: &[f32]) -> Result<Vec<f32>, String> {
+                self.entered.send(()).unwrap();
+                let stop = self
+                    .stop
+                    .as_ref()
+                    .ok_or("Missing nested cancellation signal")?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !stop.load(Ordering::Acquire) {
+                    if Instant::now() >= deadline {
+                        return Err("Inference did not observe cancellation".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err("AI session stopped".into())
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut mixer = MixProcessor::new(
+            Arc::new(Mutex::new(LiveControls::default())),
+            Arc::new(Mutex::new(Soundboard::with_defaults())),
+            Some(Box::new(WaitingAi {
+                stop: None,
+                entered: entered_tx,
+            })),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        mixer.set_stop_signal(stop.clone());
+        let worker = std::thread::spawn(move || {
+            let _ = result_tx.send(mixer.process(&[0.2; 960]));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::Release);
+        let result = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.unwrap_err(), "AI session stopped");
     }
 
     #[test]

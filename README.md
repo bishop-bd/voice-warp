@@ -89,13 +89,13 @@ Settings and imported paths are saved in the user's configuration directory. Ori
 
 ## Optional local AI
 
-On Linux x86-64, Voice Warp manages its own **bundled RVC worker**. In **Local AI**, install the engine once, choose an RVC `.pth` or `.onnx` model and optional `.index`, and select **AI voice**. Voice Warp starts inference with the microphone and removes the worker when you stop. Model selection, pitch, and index strength are controlled in English inside Voice Warp. No w-okada server or browser interface is required.
+Voice Warp manages its own **RVC worker** through private process pipes. Choose **Local AI → Bundled engine**, select a processing backend, install its runtime, then choose a trusted RVC `.pth` or compatible `.onnx` model and optional `.index`. The app owns startup and shutdown; it does not require a separately installed w-okada server or browser interface.
 
-First-time setup uses Podman to download an isolated CPU runtime and checksum-verified shared inference weights. Standard effects and soundboard do not need this runtime. The engine recipe and worker are embedded in the desktop binary, including packaged releases; the large runtime is downloaded only when you choose **Install / repair AI engine**. Setup can also run with `voice-warp --install-ai`.
+Linux x86-64 uses Podman runtime variants for CPU, NVIDIA CUDA, AMD ROCm, and AMD MIGraphX. GPU paths require compatible drivers/hardware and remain subject to device/model qualification. **Auto** tests installed GPU runtimes before CPU and reports fallback reasons before streaming begins. Install the desired backend explicitly first. **Check available devices** probes the installed runtime; **Test voice engine** warms up the selected model and reports actual device and stage placement. GPU processing can include CPU stages.
 
-The bundled runtime currently supports Linux x86-64 and standard HuBERT RVC v1/v2 models. Windows/macOS retain the optional external w-okada v1 adapter. See [AI setup and limitations](docs/AI.md).
+Windows x64 and macOS have native worker launchers, a verified-package installer, and runtime build workflows. The native workflow builds separate runtimes and can assemble desktop packages with an authenticated CPU runtime for offline setup. **The source catalog has no published artifacts yet**; native builds and hardware tests remain release gates. See [native runtime packages](docs/AI-RUNTIME-PACKAGES.md). Native CUDA/ROCm/DirectML, Apple Silicon Metal and Core ML paths have build profiles; they still require native hardware qualification. Intel Mac Core ML is experimental, and current NVIDIA CUDA is unavailable on macOS. **Export ONNX voice** converts supported trusted `.pth` voices into validated graph bundles for ONNX backends. The optional external w-okada v1 adapter remains available on all three platforms.
 
-AI audio travels over private process pipes; the bundled worker has networking disabled and receives only the selected model/index files as read-only mounts. Failed conversion never substitutes your raw microphone. CPU performance depends on the model and hardware; larger chunks trade latency for throughput.
+Linux workers run in network-disabled containers with read-only selected-model mounts. Native workers run with the user's permissions; trusted model files are required. Conversion errors stop AI output and never substitute your raw microphone. Ordinary effects and the soundboard need no AI runtime. See [AI setup, GPU limitations, and verification](docs/AI.md).
 
 ## Audio routing and failure behavior
 

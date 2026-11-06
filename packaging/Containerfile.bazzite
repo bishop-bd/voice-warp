@@ -13,6 +13,8 @@ RUN dnf install -y \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY engine ./engine
+COPY tests ./tests
 COPY scripts/test-pipewire.sh ./scripts/test-pipewire.sh
 RUN cargo test --locked \
     && cargo build --release --locked \

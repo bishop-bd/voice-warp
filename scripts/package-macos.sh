@@ -6,12 +6,16 @@ if [[ "$(uname -s)" != Darwin ]]; then
     echo 'Build the macOS app on a Mac with Xcode Command Line Tools and Rust installed.' >&2
     exit 1
 fi
-for program in cargo rustc xcrun plutil codesign ditto shasum; do
+for program in cargo rustc xcrun plutil codesign ditto shasum python3; do
     if ! command -v "$program" >/dev/null 2>&1; then
-        echo "Missing $program. Install Xcode Command Line Tools and Rust first." >&2
+        echo "Missing $program. Install Xcode Command Line Tools, Rust, and Python 3.10 or newer first." >&2
         exit 1
     fi
 done
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+    echo 'Desktop packaging needs Python 3.10 or newer; building AI runtimes needs Python 3.12.' >&2
+    exit 1
+fi
 xcrun --find clang >/dev/null
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -32,6 +36,13 @@ case "$target" in
 esac
 
 cd -- "$project_root"
+runtime_arch="$architecture"
+if [[ "$runtime_arch" == arm64 ]]; then runtime_arch=aarch64; fi
+catalog_args=(--check-desktop --target "macos-$runtime_arch")
+if [[ -n "${VOICE_WARP_RUNTIME_BUNDLE:-}" ]]; then
+    catalog_args+=(--verify-bundle "$VOICE_WARP_RUNTIME_BUNDLE")
+fi
+python3 scripts/assemble-ai-release.py "${catalog_args[@]}"
 # Match LSMinimumSystemVersion in the bundle; the default is macOS 11 or newer.
 MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --locked --target "$target" --target-dir "$project_root/target"
 
@@ -54,9 +65,15 @@ install -m644 "$project_root/packaging/Info.plist" "$app_dir/Contents/Info.plist
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app_dir/Contents/Info.plist"
 plutil -lint "$app_dir/Contents/Info.plist"
 
-# Ad-hoc signing supports local development; this is not Developer ID signing
-# or notarization. No hardened-runtime/sandbox entitlements are enabled here.
-codesign --force --sign - "$app_dir"
+if [[ -n "${VOICE_WARP_RUNTIME_BUNDLE:-}" ]]; then
+    cp -R "$VOICE_WARP_RUNTIME_BUNDLE/ai-runtimes" "$app_dir/Contents/Resources/ai-runtimes"
+fi
+if [[ -n "${VOICE_WARP_CODESIGN_IDENTITY:-}" ]]; then
+    codesign --force --options runtime --timestamp --entitlements "$project_root/packaging/desktop-entitlements.plist" --sign "$VOICE_WARP_CODESIGN_IDENTITY" "$app_dir"
+else
+    # Ad-hoc signing is only a local development build.
+    codesign --force --sign - "$app_dir"
+fi
 codesign --verify --strict "$app_dir"
 cp "$project_root/LICENSE" "$project_root/README.md" "$payload_dir/"
 cp -R "$project_root/docs" "$payload_dir/docs"
@@ -65,6 +82,15 @@ cp -R "$project_root/docs" "$payload_dir/docs"
     shasum -a 256 'Voice Warp.app/Contents/MacOS/voice-warp' > SHA256SUMS.txt
 )
 ditto -c -k --sequesterRsrc --keepParent "$payload_dir" "$output_dir/$package_name.zip"
+if [[ -n "${VOICE_WARP_NOTARY_PROFILE:-}" ]]; then
+    xcrun notarytool submit "$output_dir/$package_name.zip" --keychain-profile "$VOICE_WARP_NOTARY_PROFILE" --wait
+    xcrun stapler staple "$app_dir"
+    xcrun stapler validate "$app_dir"
+    # The stapled ticket changes the app; recreate its distribution archive and
+    # compute the checksum only after the final bytes are in place.
+    rm -- "$output_dir/$package_name.zip"
+    ditto -c -k --sequesterRsrc --keepParent "$payload_dir" "$output_dir/$package_name.zip"
+fi
 (
     cd -- "$output_dir"
     shasum -a 256 "$package_name.zip" > "$package_name.zip.sha256"

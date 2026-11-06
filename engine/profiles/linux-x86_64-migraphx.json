@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "id": "linux-x86_64-migraphx",
+  "os": "linux",
+  "arch": "x86_64",
+  "backend": "migraphx",
+  "python": "3.12",
+  "minimum_os": "Ubuntu 24.04 container; ROCm host/driver compatibility required",
+  "lock": "linux-x86_64-migraphx.txt",
+  "requirements": [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "numba==0.61.2",
+    "resampy==0.4.3",
+    "onnx==1.19.1",
+    "faiss-cpu==1.12.0",
+    "soundfile==0.13.1",
+    "dataclasses-json==0.6.7",
+    "setuptools==80.9.0",
+    "pip==25.3",
+    "wheel==0.45.1",
+    "pyinstaller==6.16.0",
+    "torch @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1.lw.gitff65f5bc-cp312-cp312-linux_x86_64.whl#sha256=fb45ace0a27e9f0d0e3c4c6efd8932162743f8376f2aa4752a4d31ef5a1bd3d7",
+    "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torchaudio-2.9.0%2Brocm7.2.1.gite3c6ee2b-cp312-cp312-linux_x86_64.whl#sha256=023d1ce5d847b2a0fbebacf52d35b4c7a233ca07b3dbd0f1cbde84362cbcf33d",
+    "triton @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/triton-3.5.1%2Brocm7.2.1.gita272dfa8-cp312-cp312-linux_x86_64.whl#sha256=07787af1d28c273852f897bfeaa7bca29f2fa4a13ca0f28f535832b240ce7016",
+    "onnxruntime-migraphx @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/onnxruntime_migraphx-1.23.2-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=663bff4dc3f72582d69f12ad073eb5695dfb526d574376cc8e5b161c7d2f0f08"
+  ],
+  "qualification": "candidate; actual platform/model/hardware qualification required",
+  "sources": [
+    "https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-7.2.1/docs/install/installryz/native_linux/install-pytorch.html"
+  ],
+  "lock_sha256": "decdf9f20389256e25b9b0bde1263a18b36f786ec5a7b9fab544de5f6a9371cf",
+  "container_base": "docker.io/rocm/pytorch@sha256:96a2fb24dec9896e2f8238178f0c49d0dcc4c7dcc597be09e4564316bd86d191"
+}

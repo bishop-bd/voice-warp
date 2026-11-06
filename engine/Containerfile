@@ -1,14 +1,36 @@
-FROM docker.io/library/ubuntu:22.04
-ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-pip python3-dev build-essential libsndfile1 && rm -rf /var/lib/apt/lists/*
+# Runtime dependencies are independently hash-locked for each backend. AMD's
+# immutable upstream image supplies the complete ROCm 7.2.1 userspace stack.
+ARG AI_BACKEND=cpu
+FROM docker.io/library/ubuntu@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS base-cpu
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git python3 python3-venv libsndfile1 && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+FROM base-cpu AS base-cuda
+
+# rocm/pytorch:rocm7.2.1_ubuntu24.04_py3.12_pytorch_release_2.9.1
+FROM docker.io/rocm/pytorch@sha256:96a2fb24dec9896e2f8238178f0c49d0dcc4c7dcc597be09e4564316bd86d191 AS base-rocm
+ENV VOICE_WARP_BASE_IMAGE_DIGEST=sha256:96a2fb24dec9896e2f8238178f0c49d0dcc4c7dcc597be09e4564316bd86d191
+FROM base-rocm AS base-migraphx
+# Upstream image already contains all ROCm dependencies. Authenticate the extra
+# compiler package itself; its configured repository is the versioned 7.2.1 repo.
+RUN curl -4fL --retry 3 https://repo.radeon.com/rocm/apt/7.2.1/pool/main/m/migraphx/migraphx_2.15.0.70201-81~24.04_amd64.deb -o /tmp/migraphx.deb && echo 'cf0381824856c7181cfc45db415c1d25a98625090cf06de98de564693c02a01e  /tmp/migraphx.deb' | sha256sum -c - && apt-get update && apt-get install -y --no-install-recommends /tmp/migraphx.deb && rm -f /tmp/migraphx.deb && rm -rf /var/lib/apt/lists/*
+
+FROM base-${AI_BACKEND} AS runtime
+ARG AI_BACKEND=cpu
+ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6 PYTHONNOUSERSITE=1 NUMBA_CACHE_DIR=/tmp/voice-warp-numba
 RUN printf '\nprecedence ::ffff:0:0/96 100\n' >> /etc/gai.conf
-RUN git init /opt/rvc && cd /opt/rvc && git remote add origin https://github.com/w-okada/voice-changer.git && git fetch --depth 1 origin d8ef15799470193f7c8176ef471245753a656626 && git checkout FETCH_HEAD
+COPY profiles /opt/voice-warp/profiles
+COPY locks /opt/voice-warp/locks
+COPY install_profile.py /opt/voice-warp/install_profile.py
+RUN python3 /opt/voice-warp/install_profile.py linux-x86_64-${AI_BACKEND}
+RUN git init /opt/rvc && cd /opt/rvc && git remote add origin https://github.com/w-okada/voice-changer.git && git fetch --depth 1 origin d8ef15799470193f7c8176ef471245753a656626 && git checkout --detach FETCH_HEAD
 WORKDIR /opt/rvc/server
-RUN python3 -m pip install 'pip==24.0' 'wheel==0.45.1' 'setuptools==70.3.0'
-RUN python3 -m pip install torch==2.0.1 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cpu
-COPY requirements.txt /opt/voice-warp/requirements.txt
-RUN python3 -m pip install -r /opt/voice-warp/requirements.txt
 RUN mkdir /assets && curl -4fL --retry 3 https://huggingface.co/ddPn08/rvc-webui-models/resolve/main/embeddings/hubert_base.pt -o /assets/hubert_base.pt && echo 'f54b40fd2802423a5643779c4861af1e9ee9c1564dc9d32f54f20b5ffba7db96  /assets/hubert_base.pt' | sha256sum -c - && curl -4fL --retry 3 https://huggingface.co/wok000/weights_gpl/resolve/main/rmvpe/rmvpe_20231006.onnx -o /assets/rmvpe.onnx && echo '84f0586308e36157f75b77c8591bf636d6719c0c4ba95f8faf3df479e7566219  /assets/rmvpe.onnx' | sha256sum -c -
 COPY worker.py /opt/rvc/server/voice_warp_worker.py
+COPY voice_warp_backend.py voice_warp_hubert.py voice_warp_rvc.py voice_warp_checkpoint.py export_models.py /opt/rvc/server/
 COPY NOTICE.md UPSTREAM-LICENSE /opt/voice-warp/
+# Read-only runtime/assets work with rootless --userns=keep-id. User models and
+# export cache are mounted separately by the app; writable scratch stays in /tmp.
+RUN chmod -R a+rX /assets /opt/voice-warp /opt/rvc
 ENTRYPOINT ["python3", "-u", "/opt/rvc/server/voice_warp_worker.py"]

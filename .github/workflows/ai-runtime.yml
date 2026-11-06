@@ -1,0 +1,136 @@
+name: Build native AI runtime candidates
+
+# Candidates require separate hardware/speech qualification and release review.
+# No upload to a public runtime catalog or signing credentials on pull requests.
+on:
+  workflow_dispatch:
+    inputs:
+      runtime_version:
+        description: Runtime version for candidate manifests
+        default: '3.0.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            backend: cpu
+            target: windows-x64
+            arch: x64
+          - os: windows-2025
+            backend: cuda
+            target: windows-x64
+            arch: x64
+          - os: windows-2025
+            backend: rocm
+            target: windows-x64
+            arch: x64
+          - os: windows-2025
+            backend: directml
+            target: windows-x64
+            arch: x64
+          - os: macos-15
+            backend: cpu
+            target: macos-arm64
+            arch: arm64
+          - os: macos-15
+            backend: mps
+            target: macos-arm64
+            arch: arm64
+          - os: macos-15
+            backend: coreml
+            target: macos-arm64
+            arch: arm64
+          - os: macos-15-intel
+            backend: cpu
+            target: macos-x64
+            arch: x64
+          - os: macos-15-intel
+            backend: coreml
+            target: macos-x64
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+      - name: Build, probe and relocate native runtime
+        env:
+          RUNTIME_VERSION: ${{ inputs.runtime_version }}
+          RUNTIME_BACKEND: ${{ matrix.backend }}
+          RUNTIME_TARGET: ${{ matrix.target }}
+          BUILD_NUMBER: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: python scripts/build-ai-runtime.py --backend "$env:RUNTIME_BACKEND" --build-id "$env:RUNTIME_TARGET-$env:RUNTIME_BACKEND-$env:BUILD_NUMBER" --runtime-version "$env:RUNTIME_VERSION"
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-runtime-${{ matrix.target }}-${{ matrix.backend }}
+          path: dist/ai-runtimes/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  offline-desktop:
+    name: Assemble offline desktop candidate (${{ matrix.target }})
+    needs: native-runtime
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            target: windows-x64
+            arch: x64
+          - os: macos-15
+            target: macos-arm64
+            arch: arm64
+          - os: macos-15-intel
+            target: macos-x64
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: ${{ matrix.arch }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ai-runtime-${{ matrix.target }}-*
+          path: dist/runtime-input
+          merge-multiple: true
+      - name: Verify artifacts and generate the compiled offline catalog
+        shell: pwsh
+        run: |
+          $manifests = @(Get-ChildItem dist/runtime-input -Filter '*.json' | ForEach-Object { $_.FullName })
+          python scripts/assemble-ai-release.py @manifests --output dist/runtime-bundle
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime assembly failed.' }
+          Remove-Item -LiteralPath dist/runtime-input -Recurse -Force
+      - name: Build offline desktop package
+        shell: pwsh
+        env:
+          VOICE_WARP_RUNTIME_BUNDLE: ${{ github.workspace }}/dist/runtime-bundle
+        run: |
+          if ($IsWindows) { ./scripts/package-windows.ps1 }
+          else { bash scripts/package-macos.sh }
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop packaging failed.' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-desktop-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            engine/runtime-catalog.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

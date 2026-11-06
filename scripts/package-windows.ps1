@@ -9,6 +9,13 @@ Set-StrictMode -Version Latest
 if ($env:OS -ne 'Windows_NT') {
     throw 'Run package-windows.ps1 on Windows with the Rust MSVC toolchain and C++ Build Tools.'
 }
+if (-not (Get-Command python -CommandType Application -ErrorAction SilentlyContinue)) {
+    throw 'Install Python 3.10 or newer and add python.exe to PATH for catalog verification and ZIP64 packaging.'
+}
+& python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+if ($LASTEXITCODE -ne 0) {
+    throw 'Python 3.10 or newer is required for desktop packaging (Python 3.12 to build AI runtimes).'
+}
 
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -21,6 +28,13 @@ if ([string]::IsNullOrWhiteSpace($version)) {
     throw 'Cannot read the package version from Cargo.toml.'
 }
 
+$runtimeBundle = [Environment]::GetEnvironmentVariable('VOICE_WARP_RUNTIME_BUNDLE', 'Process')
+$catalogArguments = @('--check-desktop', '--target', 'windows-x86_64')
+if (-not [string]::IsNullOrEmpty($runtimeBundle)) {
+    $catalogArguments += @('--verify-bundle', $runtimeBundle)
+}
+& python (Join-Path $PSScriptRoot 'assemble-ai-release.py') @catalogArguments
+if ($LASTEXITCODE -ne 0) { throw 'Desktop runtime catalog or offline bundle verification failed.' }
 $target = 'x86_64-pc-windows-msvc'
 $packageName = "voice-warp-$version-windows-x86_64"
 $targetDirectory = Join-Path $projectRoot 'target'
@@ -59,12 +73,37 @@ $payloadDirectory = Join-Path $stagingRoot $packageName
 New-Item -ItemType Directory -Path $payloadDirectory | Out-Null
 try {
     Copy-Item -LiteralPath $binaryPath -Destination (Join-Path $payloadDirectory 'voice-warp.exe')
+    if (-not [string]::IsNullOrEmpty($runtimeBundle)) {
+        # Runtime archives are immutable and may be several GiB. Stage hard
+        # links on the same volume so ZIP64 packaging does not require a third
+        # full copy; fall back to ordinary copying across filesystems.
+        $runtimeSource = (Resolve-Path -LiteralPath (Join-Path $runtimeBundle 'ai-runtimes')).Path
+        $runtimeDestination = Join-Path $payloadDirectory 'ai-runtimes'
+        foreach ($runtimeFile in Get-ChildItem -LiteralPath $runtimeSource -File -Recurse) {
+            $relative = $runtimeFile.FullName.Substring($runtimeSource.Length + 1)
+            $destination = Join-Path $runtimeDestination $relative
+            New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($destination)) -Force | Out-Null
+            try {
+                New-Item -ItemType HardLink -Path $destination -Value $runtimeFile.FullName -ErrorAction Stop | Out-Null
+            } catch {
+                Copy-Item -LiteralPath $runtimeFile.FullName -Destination $destination
+            }
+        }
+    }
+    if ($env:VOICE_WARP_WINDOWS_CERT_SHA1) {
+        & signtool sign /sha1 $env:VOICE_WARP_WINDOWS_CERT_SHA1 /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 (Join-Path $payloadDirectory 'voice-warp.exe')
+        if ($LASTEXITCODE -ne 0) { throw 'Desktop Authenticode signing failed.' }
+        & signtool verify /pa (Join-Path $payloadDirectory 'voice-warp.exe')
+        if ($LASTEXITCODE -ne 0) { throw 'Desktop Authenticode verification failed.' }
+    }
     Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination $payloadDirectory
     Copy-Item -LiteralPath (Join-Path $projectRoot 'README.md') -Destination $payloadDirectory
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs') -Destination (Join-Path $payloadDirectory 'docs') -Recurse
     $binaryHash = (Get-FileHash -LiteralPath (Join-Path $payloadDirectory 'voice-warp.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText((Join-Path $payloadDirectory 'SHA256SUMS.txt'), "$binaryHash  voice-warp.exe`n", [Text.UTF8Encoding]::new($false))
-    Compress-Archive -LiteralPath $payloadDirectory -DestinationPath $archivePath -Force
+    # Runtime archives can exceed Compress-Archive's 2 GiB per-file limit.
+    & python -m zipfile -c $archivePath $payloadDirectory
+    if ($LASTEXITCODE -ne 0) { throw 'ZIP64 desktop packaging failed.' }
     $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     [IO.File]::WriteAllText("$archivePath.sha256", "$archiveHash  $packageName.zip`n", [Text.UTF8Encoding]::new($false))
 } finally {

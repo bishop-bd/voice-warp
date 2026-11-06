@@ -2,11 +2,13 @@
 use crate::audio::Processor;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::process::Command;
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,8 +17,15 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const IMAGE: &str = "localhost/voice-warp-rvc:1";
+pub mod benchmark;
+mod launch;
+mod process;
+pub mod runtime;
+
+pub use launch::IMAGE;
 const RESPONSE_LIMIT: u64 = 300_000;
+static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
 static SESSION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
@@ -26,6 +35,8 @@ pub struct RvcConfig {
     pub pitch: i32,
     pub index_ratio: f32,
     pub block_size: usize,
+    pub backend: String,
+    pub device: String,
 }
 
 pub fn runtime_dir() -> PathBuf {
@@ -33,69 +44,101 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 pub fn supported() -> bool {
-    cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")
-}
-
-fn podman() -> Command {
-    // Distrobox shares the user's home with the host. Build and run the worker
-    // using host Podman rather than nesting containers inside the desktop app.
-    if std::env::var_os("CONTAINER_ID").is_some() && Path::new("/run/.containerenv").exists() {
-        let mut command = Command::new("distrobox-host-exec");
-        command.arg("podman");
-        command
-    } else {
-        Command::new("podman")
-    }
+    (cfg!(any(target_os = "linux", target_os = "windows")) && cfg!(target_arch = "x86_64"))
+        || (cfg!(target_os = "macos") && cfg!(any(target_arch = "x86_64", target_arch = "aarch64")))
 }
 
 pub fn install() -> Result<(), String> {
+    install_backend("cpu", Arc::new(AtomicBool::new(false)))
+}
+
+pub fn install_backend(backend: &str, stop: Arc<AtomicBool>) -> Result<(), String> {
     if !supported() {
-        return Err("The bundled RVC runtime currently supports Linux x86-64. External AI servers remain available on other platforms.".into());
+        return Err("No bundled AI runtime is available for this OS/architecture.".into());
     }
-    let dir = runtime_dir();
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let lock = File::create(dir.join("install.lock")).map_err(|e| e.to_string())?;
-    fs2::FileExt::try_lock_exclusive(&lock)
-        .map_err(|_| "AI engine installation is already running.".to_string())?;
-    for (name, contents) in [
-        ("Containerfile", include_str!("../engine/Containerfile")),
-        (
-            "requirements.txt",
-            include_str!("../engine/requirements.txt"),
-        ),
-        ("worker.py", include_str!("../engine/worker.py")),
-        ("NOTICE.md", include_str!("../engine/NOTICE.md")),
-        (
-            "UPSTREAM-LICENSE",
-            include_str!("../engine/UPSTREAM-LICENSE"),
-        ),
+    if stop.load(Ordering::Relaxed) {
+        return Err("AI installation canceled.".into());
+    }
+    launch::install(backend, &stop)
+}
+
+pub fn diagnostics(backend: &str, device: &str, stop: Arc<AtomicBool>) -> Result<Value, String> {
+    if backend == "auto" {
+        let mut devices = Vec::new();
+        let mut runtimes = Vec::new();
+        let mut warnings = Vec::new();
+        for backend in launch::installed_backends(&stop)? {
+            if stop.load(Ordering::Relaxed) {
+                return Err("AI operation canceled.".into());
+            }
+            match diagnostics(backend, device, stop.clone()) {
+                Ok(report) => {
+                    for entry in report["devices"].as_array().unwrap() {
+                        let mut entry = entry.clone();
+                        entry["runtime_backend"] = json!(backend);
+                        if !devices.contains(&entry) {
+                            devices.push(entry);
+                        }
+                    }
+                    runtimes.push(json!({"backend":backend,"report":report}));
+                }
+                Err(error) => warnings.push(format!("{backend}: {error}")),
+            }
+        }
+        if runtimes.is_empty() {
+            return Err(warnings.join("\n"));
+        }
+        return Ok(json!({"protocol":2,"devices":devices,"runtimes":runtimes,
+            "warnings":warnings,"status":"detected","model_verified":false}));
+    }
+    let spec = launch::worker(backend, device, None, None, &stop)?;
+    let mut worker = RvcProcessor::spawn_spec(spec, 0, stop)?;
+    let report = worker.reply(Duration::from_secs(90))?;
+    if report["protocol"] != 2 || !report["devices"].is_array() {
+        return Err("Incompatible AI device probe. Repair the runtime.".into());
+    }
+    Ok(report)
+}
+
+/// Export trusted legacy checkpoints in the managed worker, never in the GUI.
+pub fn export_model(model: &Path, backend: &str, stop: Arc<AtomicBool>) -> Result<Value, String> {
+    let model = model_file(model, &["pth"])?;
+    let cache = runtime_dir().join("exports");
+    fs::create_dir_all(&cache).map_err(|e| e.to_string())?;
+    let cache = fs::canonicalize(cache).map_err(|e| e.to_string())?;
+    let spec = launch::exporter(backend, &model, &cache, &stop)?;
+    let mut worker = RvcProcessor::spawn_spec(spec, 0, stop)?;
+    let mut result = worker.reply(Duration::from_secs(1800))?;
+    if result["protocol"] != 2 || result["exported"] != true || result["cpu_validated"] != true {
+        return Err("The worker did not return a validated ONNX export.".into());
+    }
+    let key = result["cache_key"]
+        .as_str()
+        .filter(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("The worker returned an invalid export cache key")?;
+    let directory = cache.join(key);
+    if !directory.join("voice.onnx").is_file() || !directory.join("export.json").is_file() {
+        return Err("The worker did not save its exported model bundle.".into());
+    }
+    result["directory"] = json!(directory);
+    for (field, file) in [
+        ("voice_model", "voice.onnx"),
+        ("hubert_model", "hubert.onnx"),
+        ("rmvpe_model", "rmvpe.onnx"),
     ] {
-        fs::write(dir.join(name), contents).map_err(|e| e.to_string())?;
+        result[field] = if directory.join(file).is_file() {
+            json!(directory.join(file))
+        } else {
+            Value::Null
+        };
     }
-    let log_path = dir.join("install.log");
-    let log = File::create(&log_path).map_err(|e| e.to_string())?;
-    let status = podman()
-        .args(["build", "-t", IMAGE, "-f"])
-        .arg(dir.join("Containerfile"))
-        .arg(&dir)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .status()
-        .map_err(|e| format!("Cannot run Podman: {e}. Install Podman, then retry AI setup."))?;
-    if !status.success() {
-        return Err(format!(
-            "AI engine installation failed. See {}",
-            log_path.display()
-        ));
-    }
-    Ok(())
+    Ok(result)
 }
 
 pub struct RvcProcessor {
-    child: Child,
+    child: process::ManagedChild,
     container: Option<String>,
-    requests: mpsc::Sender<Value>,
+    requests: mpsc::SyncSender<Value>,
     replies: mpsc::Receiver<Result<Value, String>>,
     pub info: Value,
     block_size: usize,
@@ -140,8 +183,39 @@ fn read_reply(reader: &mut impl BufRead) -> Result<Value, String> {
 
 impl RvcProcessor {
     pub fn new(config: RvcConfig) -> Result<Self, String> {
+        Self::new_cancellable(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn new_cancellable(config: RvcConfig, stop: Arc<AtomicBool>) -> Result<Self, String> {
+        Self::start(config, stop, false)
+    }
+
+    fn start(
+        config: RvcConfig,
+        stop: Arc<AtomicBool>,
+        measure_performance: bool,
+    ) -> Result<Self, String> {
         if !supported() {
-            return Err("Bundled AI currently requires Linux x86-64.".into());
+            return Err("No bundled AI runtime is available for this OS/architecture.".into());
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Err("AI session stopped.".into());
+        }
+        if config.backend == "auto" {
+            let backends = launch::installed_backends(&stop)?;
+            let (mut worker, skipped) = choose_auto(&backends, &stop, |backend| {
+                let mut candidate = config.clone();
+                candidate.backend = backend.into();
+                // A saved GPU UUID constrains GPU selection, but cannot identify
+                // the CPU fallback explicitly requested by Auto policy.
+                if backend == "cpu" {
+                    candidate.device = "cpu".into();
+                }
+                Self::start(candidate, stop.clone(), true)
+            })?;
+            worker.info["requested_backend"] = json!("auto");
+            worker.info["fallback_reasons"] = json!(skipped);
+            return Ok(worker);
         }
         if ![4096, 6144, 8192, 12288].contains(&config.block_size)
             || !(-24..=24).contains(&config.pitch)
@@ -151,100 +225,94 @@ impl RvcProcessor {
             return Err("Invalid RVC audio, pitch, or index settings.".into());
         }
         let model = model_file(&config.model, &["pth", "onnx"])?;
-        let installed = podman()
-            .args(["image", "exists", IMAGE])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| format!("Cannot run Podman: {e}. Install Podman, then run AI setup."))?;
-        if !installed.success() {
-            return Err("The bundled AI engine is not installed. Open Local AI and choose Install / repair AI engine.".into());
-        }
         let index = if config.index.as_os_str().is_empty() {
             None
         } else {
             Some(model_file(&config.index, &["index"])?)
         };
-        // Mount syntax uses commas, so reject ambiguous paths instead of mounting
-        // a different location. Spaces and Unicode remain supported.
-        if std::iter::once(&model)
-            .chain(index.iter())
-            .any(|p| p.to_string_lossy().contains(','))
-        {
-            return Err("Move the model/index to a folder without commas in its path.".into());
+        let mut spec = launch::worker(
+            &config.backend,
+            &config.device,
+            Some(&model),
+            index.as_deref(),
+            &stop,
+        )?;
+        spec.init["block_size"] = json!(config.block_size);
+        spec.init["pitch"] = json!(config.pitch);
+        spec.init["index_ratio"] = json!(config.index_ratio);
+        spec.init["measure_performance"] = json!(measure_performance);
+        let mut worker = Self::spawn_spec(spec, config.block_size, stop)?;
+        // ONNX compiler providers can spend several minutes compiling a new
+        // voice. Cancellation remains responsive throughout this bounded wait.
+        let startup_seconds = if ["migraphx", "coreml"].contains(&config.backend.as_str()) {
+            900
+        } else {
+            180
+        };
+        let ready = worker.reply(Duration::from_secs(startup_seconds))?;
+        validate_ready(&ready, &config.backend)?;
+        if measure_performance {
+            validate_auto_timing(&ready, config.block_size)?;
         }
-        let extension = model.extension().unwrap().to_str().unwrap();
-        let model_name = format!("model.{extension}");
-        let id = format!(
-            "voice-warp-rvc-{}-{}-{}",
+        worker.info = ready;
+        worker.info["log_file"] = json!(worker.log_path);
+        worker.info["model_name"] = json!(model.file_stem().unwrap_or_default().to_string_lossy());
+        worker.info["block_size"] = json!(config.block_size);
+        Ok(worker)
+    }
+
+    fn spawn_spec(
+        spec: launch::Launch,
+        block_size: usize,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let dir = runtime_dir();
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let log_path = dir.join(format!(
+            "engine-{}-{}-{}.log",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos(),
-            SESSION.fetch_add(1, Ordering::Relaxed)
-        );
-        let dir = runtime_dir();
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let log_path = dir.join("engine.log");
+                .as_millis(),
+            LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         let log = File::create(&log_path).map_err(|e| e.to_string())?;
-        let mut command = podman();
-        command
-            .args([
-                "run",
-                "--rm",
-                "-i",
-                "--pull=never",
-                "--network=none",
-                "--cap-drop=all",
-                "--security-opt=no-new-privileges",
-                "--security-opt=label=disable",
-                "--name",
-                &id,
-                "--mount",
-            ])
-            .arg(format!(
-                "type=bind,src={},dst=/models/0/{model_name},ro=true",
-                model.display()
-            ));
-        if let Some(index) = index.as_ref() {
-            command.arg("--mount").arg(format!(
-                "type=bind,src={},dst=/models/0/voice.index,ro=true",
-                index.display()
-            ));
-        }
-        command.arg(IMAGE);
-        let init = json!({"protocol":1,"model_file":model_name,"has_index":index.is_some(),
-            "block_size":config.block_size,"pitch":config.pitch,"index_ratio":config.index_ratio});
-        let mut processor = Self::spawn(command, log, log_path, Some(id), init, config.block_size)?;
-        processor.info = json!({"backend":"Voice Warp RVC", "model_name":model.file_stem().unwrap_or_default().to_string_lossy(),
-            "device":"CPU", "sample_rate":48000,"block_size":config.block_size});
-        Ok(processor)
+        Self::spawn(spec, log, log_path, block_size, stop)
     }
 
     fn spawn(
-        mut command: Command,
+        mut spec: launch::Launch,
         log: File,
         log_path: PathBuf,
-        container: Option<String>,
-        init: Value,
         block_size: usize,
+        stop: Arc<AtomicBool>,
     ) -> Result<Self, String> {
-        let mut child = command
+        if stop.load(Ordering::Relaxed) {
+            return Err("AI session stopped.".into());
+        }
+        spec.command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(log)
-            .spawn()
-            .map_err(|e| {
-                format!("Cannot start the AI engine: {e}. Run Install AI engine first.")
-            })?;
-        let mut input = child.stdin.take().unwrap();
-        let mut output = BufReader::new(child.stdout.take().unwrap());
-        let (tx, rx) = mpsc::channel::<Value>();
-        let (reply_tx, reply_rx) = mpsc::channel();
+            .stderr(log);
+        let mut child = process::ManagedChild::spawn(&mut spec.command)?;
+        child.retain(spec.lease.take());
+        let mut input = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or("Missing AI input pipe")?;
+        let mut output = BufReader::new(
+            child
+                .child_mut()
+                .stdout
+                .take()
+                .ok_or("Missing AI output pipe")?,
+        );
+        let (tx, rx) = mpsc::sync_channel::<Value>(1);
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            for request in std::iter::once(init).chain(rx) {
+            for request in std::iter::once(spec.init).chain(rx) {
                 let response = (|| {
                     serde_json::to_writer(&mut input, &request).map_err(|e| e.to_string())?;
                     input
@@ -259,9 +327,9 @@ impl RvcProcessor {
                 }
             }
         });
-        let mut result = Self {
+        Ok(Self {
             child,
-            container,
+            container: spec.container,
             requests: tx,
             replies: reply_rx,
             info: Value::Null,
@@ -269,13 +337,8 @@ impl RvcProcessor {
             sequence: 0,
             failure: None,
             log_path,
-            stop: Arc::new(AtomicBool::new(false)),
-        };
-        let ready = result.reply(Duration::from_secs(90))?;
-        if ready["protocol"] != 1 || ready["ready"] != true || ready["sample_rate"] != 48000 {
-            return Err("Incompatible AI engine handshake. Reinstall the bundled engine.".into());
-        }
-        Ok(result)
+            stop,
+        })
     }
 
     fn reply(&mut self, timeout: Duration) -> Result<Value, String> {
@@ -363,16 +426,19 @@ impl Processor for RvcProcessor {
 
 impl RvcProcessor {
     fn terminate(&mut self) {
-        if let Some(name) = self.container.take() {
-            let _ = podman()
-                .args(["rm", "--force", "--time=0", "--ignore", &name])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        if self.failure.is_none() && self.info["ready"] == true {
+            // No conversion is in flight when a healthy processor is dropped.
+            // Give the private worker a short opportunity to release resources;
+            // the owned process/container cleanup remains authoritative.
+            if self.requests.try_send(json!({"action":"shutdown"})).is_ok() {
+                let _ = self.replies.recv_timeout(Duration::from_millis(100));
+            }
+            self.info["ready"] = json!(false);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(name) = self.container.take() {
+            launch::remove_container(&name);
+        }
+        self.child.terminate();
     }
 }
 
@@ -382,23 +448,187 @@ impl Drop for RvcProcessor {
     }
 }
 
+fn validate_ready(ready: &Value, requested: &str) -> Result<(), String> {
+    if ready["protocol"] != 2
+        || ready["ready"] != true
+        || ready["sample_rate"] != 48000
+        || ready["device"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        || ready["device_id"]
+            .as_str()
+            .is_none_or(|value| value.trim().is_empty())
+        || !ready["stages"].is_object()
+        || [
+            "hubert",
+            "pitch",
+            "synthesizer",
+            "index",
+            "resample",
+            "overlap",
+        ]
+        .iter()
+        .any(|stage| {
+            ready["stages"][stage]
+                .as_str()
+                .is_none_or(|value| value.trim().is_empty())
+        })
+        || ready["runtime_version"].as_str().is_none_or(str::is_empty)
+    {
+        return Err("Incompatible AI engine handshake. Repair the bundled runtime.".into());
+    }
+    let actual = ready["backend"]
+        .as_str()
+        .ok_or("Worker did not report its backend")?;
+    if ![
+        "cpu", "cuda", "rocm", "migraphx", "mps", "coreml", "directml",
+    ]
+    .contains(&actual)
+        || (requested != "auto" && actual != requested)
+    {
+        return Err("AI worker selected a different backend than requested.".into());
+    }
+    Ok(())
+}
+
+fn choose_auto<T>(
+    backends: &[&str],
+    stop: &AtomicBool,
+    mut attempt: impl FnMut(&str) -> Result<T, String>,
+) -> Result<(T, Vec<String>), String> {
+    let mut skipped = Vec::new();
+    for backend in backends {
+        if stop.load(Ordering::Relaxed) {
+            return Err("AI session stopped.".into());
+        }
+        match attempt(backend) {
+            Ok(result) => return Ok((result, skipped)),
+            Err(error) => skipped.push(format!("{backend}: {error}")),
+        }
+    }
+    if stop.load(Ordering::Relaxed) {
+        return Err("AI session stopped.".into());
+    }
+    Err(format!(
+        "No installed runtime could initialize this voice.\n{}",
+        skipped.join("\n")
+    ))
+}
+
+fn validate_auto_timing(ready: &Value, block_size: usize) -> Result<(), String> {
+    let timing = ready["steady_state_ms"]["p50"]
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or(
+            "This runtime cannot measure Auto readiness; repair it or select an explicit backend",
+        )?;
+    let budget = block_size as f64 / 48.0;
+    if timing >= budget {
+        return Err(format!(
+            "Measured processing takes {timing:.1} ms per {budget:.1} ms audio block. Select a larger chunk or a faster backend."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
-    fn fake_worker(body: &str) -> RvcProcessor {
+    #[test]
+    fn auto_rejects_a_successful_but_too_slow_warmup() {
+        assert!(validate_auto_timing(&json!({"steady_state_ms":{"p50":120.0}}), 8192).is_ok());
+        assert!(
+            validate_auto_timing(&json!({"steady_state_ms":{"p50":360.0}}), 8192)
+                .unwrap_err()
+                .contains("360.0")
+        );
+        assert!(validate_auto_timing(&json!({}), 8192).is_err());
+    }
+    #[test]
+    fn auto_requires_successful_initialization_and_preserves_fallback_reasons() {
+        let mut attempted = Vec::new();
+        let (selected, failures) = choose_auto(
+            &["cuda", "rocm", "cpu"],
+            &AtomicBool::new(false),
+            |backend| {
+                attempted.push(backend.to_string());
+                match backend {
+                    "cuda" => Err("warmup failed".into()),
+                    _ => Ok(backend.to_string()),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, "rocm");
+        assert_eq!(attempted, ["cuda", "rocm"]);
+        assert_eq!(failures, ["cuda: warmup failed"]);
+    }
+
+    #[test]
+    fn auto_cancellation_prevents_cpu_fallback() {
+        let stop = AtomicBool::new(false);
+        let mut attempted = 0;
+        let result = choose_auto::<()>(&["cuda", "cpu"], &stop, |_| {
+            attempted += 1;
+            stop.store(true, Ordering::Relaxed);
+            Err("GPU canceled".into())
+        });
+        assert!(result.unwrap_err().contains("stopped"));
+        assert_eq!(attempted, 1);
+    }
+
+    fn fixture_command(mode: &str, response: Value) -> Command {
+        static EXECUTABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let executable = EXECUTABLE.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("voice-warp-worker-fixture-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("worker{}", std::env::consts::EXE_SUFFIX));
+            let status = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .arg("--edition=2021")
+                .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rvc_worker.rs"))
+                .arg("-o")
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            path
+        });
+        let mut command = Command::new(executable);
+        command.env("VOICE_WARP_FIXTURE_MODE",mode)
+            .env("VOICE_WARP_FIXTURE_READY",json!({"protocol":2,"ready":true,"sample_rate":48000,"device":"CPU","device_id":"cpu","backend":"cpu","stages":{"hubert":"CPU","pitch":"CPU","synthesizer":"CPU","index":"not used","resample":"CPU","overlap":"CPU"},"runtime_version":"test"}).to_string())
+            .env("VOICE_WARP_FIXTURE_REPLY",response.to_string());
+        command
+    }
+
+    fn fixture(mode: &str, response: Value, stop: Arc<AtomicBool>) -> RvcProcessor {
         let log_path = std::env::temp_dir().join(format!(
-            "voice-warp-rvc-test-{}-{}.log",
+            "voice-warp-fixture-{}-{}.log",
             std::process::id(),
             SESSION.fetch_add(1, Ordering::Relaxed)
         ));
         let log = File::create(&log_path).unwrap();
-        let mut command = Command::new("python3");
-        command.args(["-u", "-c", &format!("import sys,json,time\njson.loads(sys.stdin.readline())\nprint(json.dumps(dict(protocol=1,ready=True,sample_rate=48000)),flush=True)\n{body}")]);
-        RvcProcessor::spawn(command, log, log_path, None, json!({}), 4096).unwrap()
+        RvcProcessor::spawn(
+            launch::Launch {
+                command: fixture_command(mode, response),
+                container: None,
+                lease: None,
+                init: json!({}),
+            },
+            log,
+            log_path,
+            4096,
+            stop,
+        )
+        .unwrap()
     }
 
-    #[cfg(target_os = "linux")]
+    fn fake_worker(mode: &str, response: Value) -> RvcProcessor {
+        let mut worker = fixture(mode, response, Arc::new(AtomicBool::new(false)));
+        validate_ready(&worker.reply(Duration::from_secs(5)).unwrap(), "cpu").unwrap();
+        worker
+    }
+
     #[test]
     fn rejects_bad_worker_audio_and_latches_failure() {
         for response in [
@@ -407,10 +637,7 @@ mod tests {
             json!({"sequence":1,"audio":"AA=="}),
             json!({"error":"inference failed"}),
         ] {
-            let mut worker = fake_worker(&format!(
-                "sys.stdin.readline()\nprint({:?},flush=True)",
-                response.to_string()
-            ));
+            let mut worker = fake_worker("reply", response);
             let error = worker.process(&vec![0.1; 4096]).unwrap_err();
             assert_eq!(worker.process(&vec![0.1; 4096]).unwrap_err(), error);
             assert!(worker.child.try_wait().unwrap().is_some());
@@ -418,10 +645,9 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn cancellation_interrupts_a_stalled_worker() {
-        let mut worker = fake_worker("sys.stdin.readline()\ntime.sleep(60)");
+        let mut worker = fake_worker("stall_audio", Value::Null);
         let stop = Arc::new(AtomicBool::new(false));
         worker.set_stop_signal(stop.clone());
         let signal = std::thread::spawn(move || {
@@ -439,6 +665,44 @@ mod tests {
         assert!(worker.child.try_wait().unwrap().is_some());
         signal.join().unwrap();
         let _ = fs::remove_file(&worker.log_path);
+    }
+
+    #[test]
+    fn cancellation_during_startup_terminates_worker() {
+        // Compile the helper before measuring cancellation responsiveness.
+        let _ = fixture_command("stall_start", Value::Null);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut worker = fixture("stall_start", Value::Null, stop.clone());
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stop.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        assert!(
+            worker
+                .reply(Duration::from_secs(90))
+                .unwrap_err()
+                .contains("stopped")
+        );
+        worker.terminate();
+        assert!(worker.child.try_wait().unwrap().is_some());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        signal.join().unwrap();
+        let _ = fs::remove_file(&worker.log_path);
+    }
+
+    #[test]
+    fn handshake_rejects_silent_device_fallback_and_old_protocol() {
+        let ready = json!({"protocol":2,"ready":true,"sample_rate":48000,"device":"CPU","device_id":"cpu","backend":"cpu","stages":{"hubert":"CPU","pitch":"CPU","synthesizer":"CPU","index":"not used","resample":"CPU","overlap":"CPU"},"runtime_version":"test"});
+        assert!(validate_ready(&ready, "cpu").is_ok());
+        assert!(validate_ready(&ready, "auto").is_ok());
+        assert!(validate_ready(&ready, "cuda").is_err());
+        let mut old = ready.clone();
+        old["protocol"] = json!(1);
+        assert!(validate_ready(&old, "cpu").is_err());
+        let mut missing = ready;
+        missing.as_object_mut().unwrap().remove("device");
+        assert!(validate_ready(&missing, "cpu").is_err());
     }
 
     #[test]
@@ -463,9 +727,11 @@ mod tests {
             pitch: 0,
             index_ratio: 0.0,
             block_size: 8192,
+            backend: std::env::var("VOICE_WARP_TEST_BACKEND").unwrap_or_else(|_| "cpu".into()),
+            device: "0".into(),
         })
         .unwrap();
-        let name = engine.container.clone().unwrap();
+        let name = engine.container.clone();
         for block in 0..4 {
             let input: Vec<f32> = (0..8192)
                 .map(|i| {
@@ -480,12 +746,14 @@ mod tests {
             }
         }
         drop(engine);
-        assert!(
-            !podman()
-                .args(["container", "exists", &name])
-                .status()
-                .unwrap()
-                .success()
-        );
+        if let Some(name) = name {
+            assert!(
+                !launch::podman()
+                    .args(["container", "exists", &name])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
 }

@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "id": "windows-x86_64-cuda",
+  "os": "windows",
+  "arch": "x86_64",
+  "backend": "cuda",
+  "python": "3.12",
+  "minimum_os": "10.0.18362",
+  "lock": "windows-x86_64-cuda.txt",
+  "requirements": [
+    "numpy==1.26.4",
+    "scipy==1.13.1",
+    "numba==0.61.2",
+    "resampy==0.4.3",
+    "onnx==1.19.1",
+    "faiss-cpu==1.12.0",
+    "soundfile==0.13.1",
+    "dataclasses-json==0.6.7",
+    "setuptools==80.9.0",
+    "pip==25.3",
+    "wheel==0.45.1",
+    "pyinstaller==6.16.0",
+    "torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.9.1%2Bcu128-cp312-cp312-win_amd64.whl#sha256=3a01f0b64c10a82d444d9fd06b3e8c567b1158b76b2764b8f51bfd8f535064b0",
+    "torchaudio @ https://download-r2.pytorch.org/whl/cu128/torchaudio-2.9.1%2Bcu128-cp312-cp312-win_amd64.whl#sha256=88896c7bfa486102439fab6c85ac834176617e9c06eb0be9074c07ee1183b47d",
+    "onnxruntime-gpu==1.23.2"
+  ],
+  "qualification": "candidate; actual platform/model/hardware qualification required",
+  "sources": [
+    "https://pytorch.org/get-started/previous-versions/",
+    "https://onnxruntime.ai/docs/execution-providers/"
+  ],
+  "lock_sha256": "43ace05b50a1f454a5db84adba8b69ec7c64b40a50729b57e570e76853b1643c"
+}
