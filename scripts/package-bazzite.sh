@@ -75,6 +75,14 @@ install -m755 "$binary_path" "$package/bin/voice-warp"
 for relative in \
     LICENSE \
     docs/BAZZITE.md \
+    docs/AI.md \
+    docs/AI-COMPATIBILITY.md \
+    docs/AI-RUNTIME-PACKAGES.md \
+    docs/AI-EXTERNAL.md \
+    docs/WINDOWS.md \
+    docs/MACOS.md \
+    engine/NOTICE.md \
+    engine/UPSTREAM-LICENSE \
     packaging/voice-warp.desktop \
     packaging/voice-warp.svg \
     scripts/install-bazzite.sh \
